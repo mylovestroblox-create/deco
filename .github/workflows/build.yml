@@ -6,11 +6,11 @@ on:
       app_name:
         description: "Название приложения"
         required: true
-        default: "My App"
+        default: "deco"
       bundle_id:
         description: "Bundle ID (например com.example.myapp)"
         required: true
-        default: "com.example.webapp"
+        default: "com.deco.app"
       url:
         description: "Ссылка на сайт (пусто = использовать папку site/ из репозитория)"
         required: false

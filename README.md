@@ -1,4 +1,4 @@
-# AQUA Deobfuscator (iOS)
+# deco
 
 iOS-приложение (`.ipa`) для деобфускации Lua/Luau. Всё работает офлайн внутри WebView.
 
