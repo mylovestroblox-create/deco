@@ -30246,4 +30246,5 @@ window.Deob={};
 Object.defineProperty(window.Deob,"prometheus",{get:function(){return load(0);}});
 Object.defineProperty(window.Deob,"clyde",{get:function(){return load(60);}});
 Object.defineProperty(window.Deob,"luaobf",{get:function(){return load(71);}});
+Object.defineProperty(window.Deob,"luaobfio",{get:function(){return load(72);}});
 })();

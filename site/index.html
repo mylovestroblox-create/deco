@@ -40,6 +40,7 @@
     box-shadow: 0 0 26px rgba(90,195,230,.35); margin-bottom: 18px;
   }
   .go:disabled { opacity: .6; }
+  .go.ghost { background: var(--panel2); color: var(--a1); border: 1.5px solid var(--line); box-shadow: none; }
   .go svg { width: 14px; height: 14px; }
   .card { border: 1.5px solid var(--line); border-radius: 22px; background: var(--panel2); overflow: hidden; margin-bottom: 18px; }
   .head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; background: var(--panel); border-bottom: 1.5px solid var(--line); }
@@ -81,9 +82,12 @@
     </div>
   </div>
 
-  <button class="go" id="go">
-    <svg viewBox="0 0 14 14" fill="currentColor"><path d="M2 1v12l10-6z"/></svg>Deobfuscate
-  </button>
+  <div class="row" style="gap:10px;margin-bottom:12px">
+    <button class="go" id="go" style="margin:0">
+      <svg viewBox="0 0 14 14" fill="currentColor"><path d="M2 1v12l10-6z"/></svg>Deobfuscate
+    </button>
+    <button class="go ghost" id="detect" style="margin:0">Detect</button>
+  </div>
   <div class="status" id="status"></div>
 
   <section class="card">
@@ -166,10 +170,44 @@
       }
     };
 
+
+    // ---- detect ----
+    var UNSUPPORTED = [
+      { name: 'Luraph', re: /protected using Luraph|lura\.ph|Luraph Obfuscator/i },
+      { name: 'MoonSec V3', re: /protected with MoonSec|MoonSec V3/i },
+      { name: '77fuscator', re: /77FUS\||77fuscator/i },
+      { name: 'IronBrew', re: /IronBrew|Iron Brew/i }
+    ];
+    function detect(s) {
+      var found = [];
+      try { var d = Deob.clyde.detectClyde(s); if (d && d.isClyde) found.push({ id: 'clyde', name: 'Clyde', ok: true, score: d.score || 1 }); } catch (e) {}
+      try {
+        var ch = null; try { ch = Deob.prometheus.parse(s, { name: 'input' }); } catch (e) {}
+        var r = Deob.prometheus.identify(s, ch);
+        if (r && r.prometheus) found.push({ id: 'prometheus', name: 'Prometheus', ok: true });
+      } catch (e) {}
+      try { var l = Deob.luaobfio.det(s); if (l && l.matched) found.push({ id: 'luaobf', name: 'LuaObfuscator', ok: true, extra: (l.family || '').replace('luaobfuscator-', '') }); } catch (e) {}
+      UNSUPPORTED.forEach(function (u) { if (u.re.test(s)) found.push({ id: null, name: u.name, ok: false }); });
+      return found;
+    }
+    function describe(found) {
+      if (!found.length) return 'Обфускатор не определён (поддерживаются Prometheus, Clyde, LuaObfuscator)';
+      return 'Определено: ' + found.map(function (f) { return f.name + (f.extra ? ' (' + f.extra + ')' : '') + (f.ok ? '' : ' — не поддерживается в приложении'); }).join(', ');
+    }
+
     function run() {
       var s = src.value;
       if (!s.trim()) { setStatus('Вставь код или открой файл', 'err'); return; }
-      var order = mode === 'auto' ? ['clyde', 'prometheus', 'luaobf'] : [mode];
+      var order;
+      if (mode === 'auto') {
+        var fd = detect(s);
+        var sup = fd.filter(function (f) { return f.ok; }).map(function (f) { return f.id; });
+        if (!sup.length) {
+          out.value = ''; updOut(); $('outInfo').textContent = '—';
+          setStatus(describe(fd), 'err'); return;
+        }
+        order = sup;
+      } else order = [mode];
       var errors = [], res = null, partial = '';
       for (var i = 0; i < order.length; i++) {
         try { res = engines[order[i]](s); break; }
@@ -193,6 +231,15 @@
       requestAnimationFrame(function () { setTimeout(function () {
         try { run(); } catch (e) { setStatus('Ошибка: ' + e.message, 'err'); }
         b.disabled = false;
+      }, 30); });
+    });
+
+    $('detect').addEventListener('click', function () {
+      var s = src.value; if (!s.trim()) { setStatus('Вставь код или открой файл', 'err'); return; }
+      setStatus('Определяю…');
+      requestAnimationFrame(function () { setTimeout(function () {
+        try { var f = detect(s); setStatus(describe(f), f.some(function (x) { return x.ok; }) ? 'ok' : 'err'); }
+        catch (e) { setStatus('Ошибка: ' + e.message, 'err'); }
       }, 30); });
     });
 
