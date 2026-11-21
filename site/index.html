@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>AQUA</title>
+<style>
+  :root {
+    --bg: #0a1a22; --panel: #112530; --panel2: #0a171e; --line: #1f4452;
+    --text: #e8f6f4; --dim: #3f8a88; --mute: #6f9aa0;
+    --a1: #8ef0d8; --a2: #5ac3e6;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--mono); }
+  body {
+    min-height: 100vh; padding: calc(env(safe-area-inset-top) + 16px) 16px calc(env(safe-area-inset-bottom) + 28px);
+    background:
+      linear-gradient(rgba(90,195,230,.04) 1px, transparent 1px) 0 0 / 40px 40px,
+      linear-gradient(90deg, rgba(90,195,230,.04) 1px, transparent 1px) 0 0 / 40px 40px,
+      radial-gradient(120% 60% at 50% 0%, #143543 0%, var(--bg) 70%);
+  }
+  .brand { display: flex; align-items: center; gap: 16px; margin-bottom: 18px; }
+  .logo { width: 52px; height: 52px; border-radius: 14px; border: 1px solid var(--line); background: #10303a; display: grid; place-items: center; }
+  .logo svg { width: 30px; height: 30px; }
+  h1 { margin: 0; font-size: 28px; letter-spacing: .32em; font-weight: 700; }
+  .row { display: flex; gap: 10px; margin-bottom: 12px; }
+  .seg {
+    flex: 1; display: flex; padding: 4px; gap: 2px; border: 1.5px solid var(--line); border-radius: 18px; background: var(--panel2);
+  }
+  .seg button {
+    flex: 1; border: 0; border-radius: 14px; padding: 12px 4px; background: transparent; color: var(--mute);
+    font: 500 13px var(--mono); letter-spacing: .04em;
+  }
+  .seg button.on { background: linear-gradient(135deg, var(--a1), var(--a2)); color: #062028; font-weight: 700; box-shadow: 0 0 22px rgba(90,195,230,.3); }
+  .go {
+    display: inline-flex; align-items: center; gap: 12px; border: 0; border-radius: 18px; padding: 15px 22px;
+    background: linear-gradient(135deg, var(--a1), var(--a2)); color: #062028; font: 700 17px var(--mono);
+    box-shadow: 0 0 26px rgba(90,195,230,.35); margin-bottom: 18px;
+  }
+  .go:disabled { opacity: .6; }
+  .go svg { width: 14px; height: 14px; }
+  .card { border: 1.5px solid var(--line); border-radius: 22px; background: var(--panel2); overflow: hidden; margin-bottom: 18px; }
+  .head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; background: var(--panel); border-bottom: 1.5px solid var(--line); }
+  .head small { display: block; color: var(--dim); font-size: 12px; letter-spacing: .24em; font-weight: 700; margin-bottom: 6px; }
+  .head b { font-size: 21px; font-weight: 700; }
+  .tools { display: flex; gap: 6px; }
+  .tools button { width: 40px; height: 40px; border: 0; border-radius: 12px; background: transparent; color: #cfe7ea; display: grid; place-items: center; }
+  .tools button:active { background: rgba(255,255,255,.08); }
+  .tools svg { width: 22px; height: 22px; }
+  textarea {
+    display: block; width: 100%; min-height: 300px; resize: vertical; border: 0; outline: 0; padding: 16px 20px;
+    background: transparent; color: var(--text); font: 14px/1.5 var(--mono); white-space: pre; overflow: auto; tab-size: 2;
+  }
+  textarea::placeholder { color: #2c5560; }
+  .foot { display: flex; justify-content: space-between; gap: 12px; padding: 14px 20px; border-top: 1.5px solid var(--line); color: var(--mute); font-size: 14px; letter-spacing: .06em; }
+  .status { min-height: 20px; margin: -6px 2px 14px; font-size: 13px; color: var(--mute); }
+  .status.err { color: #ff8f8f; } .status.ok { color: var(--a1); }
+  input[type=file] { display: none; }
+  .toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 24px); transform: translateX(-50%); background: #123541; border: 1px solid var(--line); padding: 10px 16px; border-radius: 14px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+  <div class="brand">
+    <div class="logo">
+      <svg viewBox="0 0 32 32" fill="none" stroke="#6ee7cf" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">
+        <path d="M16 3 27 9.5v13L16 29 5 22.5v-13z"/><path d="M10.5 21 16 10l5.5 11M12.5 17.5h7"/>
+      </svg>
+    </div>
+    <h1>AQUA</h1>
+  </div>
+
+  <div class="row">
+    <div class="seg" id="type">
+      <button data-v="auto" class="on">Auto</button>
+      <button data-v="prometheus">Prometheus</button>
+      <button data-v="clyde">Clyde</button>
+      <button data-v="luaobf">LuaObf</button>
+    </div>
+  </div>
+
+  <button class="go" id="go">
+    <svg viewBox="0 0 14 14" fill="currentColor"><path d="M2 1v12l10-6z"/></svg>Deobfuscate
+  </button>
+  <div class="status" id="status"></div>
+
+  <section class="card">
+    <div class="head">
+      <div><small>01 / SOURCE</small><b>Input</b></div>
+      <div class="tools">
+        <button id="paste" aria-label="Paste"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4M7.5 8.5 12 4l4.5 4.5M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5"/></svg></button>
+        <button id="open" aria-label="Open file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button>
+        <button id="clear" aria-label="Clear"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg></button>
+      </div>
+    </div>
+    <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" placeholder="-- вставь обфусцированный Lua/Luau код"></textarea>
+    <div class="foot"><span id="inSize">0 B</span><span>Lua 5.1 + Luau extensions</span></div>
+  </section>
+
+  <section class="card">
+    <div class="head">
+      <div><small>02 / RESULT</small><b>Output</b></div>
+      <div class="tools">
+        <button id="copy" aria-label="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg></button>
+        <button id="share" aria-label="Share"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M7.5 7.5 12 3l4.5 4.5M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg></button>
+      </div>
+    </div>
+    <textarea id="out" spellcheck="false" readonly placeholder="-- здесь появится результат"></textarea>
+    <div class="foot"><span id="outSize">0 B</span><span id="outInfo">—</span></div>
+  </section>
+
+  <input type="file" id="file" accept=".lua,.luau,.txt,.luac,text/plain,application/octet-stream">
+  <div class="toast" id="toast"></div>
+
+  <script src="deob.bundle.js"></script>
+  <script>
+  (function () {
+    var $ = function (id) { return document.getElementById(id); };
+    var src = $('src'), out = $('out'), statusEl = $('status'), mode = 'auto';
+    var NAMES = { prometheus: 'Prometheus', clyde: 'Clyde', luaobf: 'LuaObfuscator' };
+
+    function size(n) { return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(2) + ' MB'; }
+    function bytes(s) { try { return new Blob([s]).size; } catch (e) { return s.length; } }
+    function toast(t) { var el = $('toast'); el.textContent = t; el.classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(function () { el.classList.remove('show'); }, 1500); }
+    function setStatus(t, cls) { statusEl.textContent = t || ''; statusEl.className = 'status ' + (cls || ''); }
+    function updIn() { $('inSize').textContent = size(bytes(src.value)); try { localStorage.setItem('aqua.src', src.value); } catch (e) {} }
+    function updOut() { $('outSize').textContent = size(bytes(out.value)); }
+
+    try { src.value = localStorage.getItem('aqua.src') || ''; } catch (e) {}
+    updIn();
+    src.addEventListener('input', updIn);
+
+    document.querySelectorAll('#type button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        document.querySelectorAll('#type button').forEach(function (x) { x.classList.remove('on'); });
+        b.classList.add('on'); mode = b.dataset.v;
+      });
+    });
+
+    // ---- engines: each returns {code, info} or throws ----
+    var engines = {
+      prometheus: function (s) {
+        var r = Deob.prometheus.deobfuscate(s, { name: 'input' });
+        var w = r.warnings && r.warnings.length ? ' · ' + r.warnings.length + ' warn' : '';
+        return { code: r.code, info: 'Prometheus' + w };
+      },
+      clyde: function (s) {
+        var d = Deob.clyde.detectClyde(s);
+        if (!d || !d.isClyde) throw new Error('не похоже на Clyde');
+        var r = Deob.clyde.deobfuscateClyde(s);
+        if (!r.success) {
+          var extra = r.decodedStrings && r.decodedStrings.length ? '\n\n-- строки, найденные до сбоя:\n' + r.decodedStrings.map(function (x) { return '-- ' + JSON.stringify(x); }).join('\n') : '';
+          var e = new Error('Clyde: ' + r.error); e.partial = extra; throw e;
+        }
+        return { code: r.output, info: 'Clyde' + (r.stats && r.stats.mode ? ' · ' + r.stats.mode : '') };
+      },
+      luaobf: function (s) {
+        var r;
+        try { r = Deob.luaobf.deobf(s, { log: false }); }
+        catch (e) { if (/^det:/.test(e.message)) throw new Error('не похоже на LuaObfuscator'); throw e; }
+        var code = r.reconstructed || r.lua;
+        if (!code) throw new Error('LuaObfuscator: пустой результат');
+        return { code: code, info: 'LuaObfuscator' + (r.detection && r.detection.family ? ' · ' + r.detection.family.replace('luaobfuscator-', '') : '') };
+      }
+    };
+
+    function run() {
+      var s = src.value;
+      if (!s.trim()) { setStatus('Вставь код или открой файл', 'err'); return; }
+      var order = mode === 'auto' ? ['clyde', 'prometheus', 'luaobf'] : [mode];
+      var errors = [], res = null, partial = '';
+      for (var i = 0; i < order.length; i++) {
+        try { res = engines[order[i]](s); break; }
+        catch (e) { errors.push(NAMES[order[i]] + ': ' + String(e && e.message || e).replace(/^unsupported Prometheus payload:.*/, 'не похоже на Prometheus').split('\n')[0].slice(0, 110)); if (e && e.partial) partial = e.partial; }
+      }
+      if (res) {
+        out.value = res.code; updOut();
+        $('outInfo').textContent = res.info;
+        setStatus('Готово · ' + res.info, 'ok');
+        out.scrollTop = 0;
+      } else {
+        out.value = partial ? '-- не удалось полностью деобфусцировать' + partial : ''; updOut();
+        $('outInfo').textContent = '—';
+        setStatus(mode === 'auto' ? 'Не удалось определить обфускатор. ' + errors.join(' | ') : errors[0], 'err');
+      }
+    }
+
+    $('go').addEventListener('click', function () {
+      var b = $('go'); b.disabled = true; setStatus('Работаю…');
+      // дать UI перерисоваться перед тяжёлой работой
+      requestAnimationFrame(function () { setTimeout(function () {
+        try { run(); } catch (e) { setStatus('Ошибка: ' + e.message, 'err'); }
+        b.disabled = false;
+      }, 30); });
+    });
+
+    $('paste').addEventListener('click', function () {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        navigator.clipboard.readText().then(function (t) { src.value = t; updIn(); toast('Вставлено'); }, function () { toast('Вставь вручную: зажми поле'); src.focus(); });
+      } else { toast('Вставь вручную: зажми поле'); src.focus(); }
+    });
+    $('open').addEventListener('click', function () { $('file').click(); });
+    $('file').addEventListener('change', function () {
+      var f = this.files && this.files[0]; if (!f) return;
+      var rd = new FileReader();
+      rd.onload = function () { src.value = rd.result; updIn(); toast(f.name); };
+      rd.readAsText(f); this.value = '';
+    });
+    $('clear').addEventListener('click', function () { src.value = ''; out.value = ''; updIn(); updOut(); setStatus(''); $('outInfo').textContent = '—'; });
+
+    function copyText(t) {
+      var done = function () { toast('Скопировано'); };
+      var fallback = function () {
+        var ta = document.createElement('textarea'); ta.value = t; ta.style.cssText = 'position:fixed;opacity:0'; document.body.appendChild(ta);
+        ta.select(); ta.setSelectionRange(0, t.length); try { document.execCommand('copy'); done(); } catch (e) { toast('Не вышло'); } document.body.removeChild(ta);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) navigator.clipboard.writeText(t).then(done, fallback); else fallback();
+    }
+    $('copy').addEventListener('click', function () { if (out.value) copyText(out.value); else toast('Пусто'); });
+    $('share').addEventListener('click', function () {
+      if (!out.value) { toast('Пусто'); return; }
+      var t = out.value;
+      if (navigator.share) {
+        try {
+          var file = new File([t], 'deobfuscated.lua', { type: 'text/plain' });
+          if (navigator.canShare && navigator.canShare({ files: [file] })) { navigator.share({ files: [file] }).catch(function () {}); return; }
+        } catch (e) {}
+        navigator.share({ text: t }).catch(function () {});
+      } else { copyText(t); }
+    });
+  })();
+  </script>
+</body>
+</html>
