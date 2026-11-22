@@ -349,7 +349,7 @@
       } else order = [mode];
       var errors = [], res = null, partial = '';
       for (var i = 0; i < order.length; i++) {
-        try { res = engines[order[i]](u8(s)); if (res && res.code) res.code = un8(res.code); break; }
+        try { res = engines[order[i]](u8(s)); if (res && res.code) { res.code = un8(res.code).replace(/^(\s*--[^\n]*(deobf|Deоbf|LeakD|VX)[^\n]*\n)+/i, ''); res.code = '-- ayo deobf by aqua deobf ngga\n\n' + res.code.replace(/^\s+/, ''); } break; }
         catch (e) { errors.push(NAMES[order[i]] + ': ' + String(e && e.message || e).replace(/^unsupported Prometheus payload:.*/, 'doesn\'t look like Prometheus').split('\n')[0].slice(0, 110)); if (e && e.partial) partial = e.partial; }
       }
       if (res) {
