@@ -2,7 +2,7 @@
 
 iOS app (`.ipa`) for deobfuscating Lua/Luau. Runs fully offline inside a WebView.
 
-Supported: Prometheus, Clyde, LuaObfuscator. Detection only: Luraph, MoonSec V3, 77fuscator, IronBrew.
+Supported: Prometheus, Clyde, LuaObfuscator, Ironveil v1. Detection only: Luraph, MoonSec V3, 77fuscator, IronBrew.
 
 ## Build
 
