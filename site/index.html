@@ -49,15 +49,33 @@
 
   .row { display: flex; gap: 10px; margin-bottom: 12px; }
   .seg { position: relative; flex: 1; display: flex; padding: 4px; gap: 0; border-radius: 20px; animation: rise .7s .05s var(--ease) both; }
+  .seg { touch-action: pan-y; user-select: none; -webkit-user-select: none; }
   .seg .thumb {
-    position: absolute; top: 4px; bottom: 4px; left: 0; width: 0; border-radius: 16px; z-index: 0;
-    background: linear-gradient(135deg, rgba(142,240,216,.95), rgba(90,195,230,.92));
-    box-shadow: 0 0 24px rgba(90,195,230,.45), inset 0 1px 0 rgba(255,255,255,.5);
-    transition: transform .55s var(--spring), width .55s var(--spring);
+    position: absolute; top: 4px; bottom: 4px; left: 0; width: 0; border-radius: 17px; z-index: 2; pointer-events: none;
+    --x: 0px; --sx: 1; --sy: 1;
+    transform: translateX(var(--x)) scale(var(--sx), var(--sy));
+    background: linear-gradient(180deg, rgba(255,255,255,.30) 0%, rgba(255,255,255,.07) 55%, rgba(120,225,235,.16) 100%);
+    -webkit-backdrop-filter: blur(1.5px) saturate(230%) brightness(1.45) contrast(1.05);
+    backdrop-filter: blur(1.5px) saturate(230%) brightness(1.45) contrast(1.05);
+    border: 1px solid rgba(255,255,255,.38);
+    box-shadow:
+      inset 0 1.5px 1px rgba(255,255,255,.75),
+      inset 0 -8px 14px rgba(90,200,235,.28),
+      inset 0 0 18px rgba(255,255,255,.14),
+      0 6px 20px rgba(0,0,0,.38),
+      0 0 26px rgba(90,195,230,.28);
+    transition: transform .6s var(--spring), width .6s var(--spring), box-shadow .4s var(--ease), background .4s var(--ease);
   }
-  .seg button { position: relative; z-index: 1; flex: 1; border: 0; border-radius: 16px; padding: 12px 4px; background: transparent; color: var(--mute); font: 500 13px var(--mono); letter-spacing: .03em; transition: color .3s var(--ease), transform .3s var(--spring); }
-  .seg button.on { color: #04222a; font-weight: 700; }
-  .seg button:active { transform: scale(.94); }
+  .seg .thumb::after { /* curved top glint */
+    content: ""; position: absolute; left: 12%; right: 12%; top: 2px; height: 38%; border-radius: 999px;
+    background: linear-gradient(180deg, rgba(255,255,255,.5), rgba(255,255,255,0));
+    opacity: .7;
+  }
+  .seg.drag .thumb { transition: width .3s var(--spring), box-shadow .3s var(--ease); }
+  .seg.press .thumb { --sy: 1.14; box-shadow: inset 0 1.5px 1px rgba(255,255,255,.85), inset 0 -8px 14px rgba(90,200,235,.35), inset 0 0 22px rgba(255,255,255,.2), 0 10px 28px rgba(0,0,0,.4), 0 0 36px rgba(110,231,207,.45); }
+  .seg button { position: relative; z-index: 1; touch-action: pan-y; flex: 1; border: 0; border-radius: 16px; padding: 12px 4px; background: transparent; color: var(--mute); font: 500 13px var(--mono); letter-spacing: .03em; transition: color .3s var(--ease), transform .3s var(--spring); }
+  .seg button.on { color: #fff; font-weight: 700; text-shadow: 0 0 14px rgba(142,240,216,.8); }
+  
 
   .go {
     display: inline-flex; align-items: center; justify-content: center; gap: 12px; border: 0; border-radius: 20px; padding: 15px 22px;
@@ -173,19 +191,55 @@
     updIn();
     src.addEventListener('input', updIn);
 
-    var seg = $('type'), thumb = seg.querySelector('.thumb');
-    function moveThumb() {
-      var on = seg.querySelector('button.on'); if (!on) return;
-      thumb.style.width = on.offsetWidth + 'px';
-      thumb.style.transform = 'translateX(' + on.offsetLeft + 'px)';
+    var seg = $('type'), thumb = seg.querySelector('.thumb'), segBtns = Array.prototype.slice.call(seg.querySelectorAll('button'));
+    var curX = 0, curW = 0, dragging = false, moved = false, grab = 0;
+    function place(btn, jelly) {
+      curW = btn.offsetWidth; curX = btn.offsetLeft;
+      thumb.style.width = curW + 'px';
+      thumb.style.setProperty('--x', curX + 'px');
+      if (jelly) { // brief squash-and-stretch as the glass slides
+        thumb.style.setProperty('--sx', 1.16); thumb.style.setProperty('--sy', .9);
+        setTimeout(function () { thumb.style.setProperty('--sx', 1); thumb.style.setProperty('--sy', 1); }, 170);
+      }
     }
-    seg.querySelectorAll('button').forEach(function (b) {
-      b.addEventListener('click', function () {
-        seg.querySelectorAll('button').forEach(function (x) { x.classList.remove('on'); });
-        b.classList.add('on'); mode = b.dataset.v; moveThumb();
-        if (navigator.vibrate) try { navigator.vibrate(8); } catch (e) {}
-      });
+    function select(btn, jelly) {
+      segBtns.forEach(function (x) { x.classList.toggle('on', x === btn); });
+      mode = btn.dataset.v; place(btn, jelly);
+    }
+    function moveThumb() { var on = seg.querySelector('button.on'); if (on) place(on, false); }
+    function nearest(cx) { // button whose centre is closest to cx (px inside seg)
+      var best = segBtns[0], bd = 1e9;
+      segBtns.forEach(function (b) { var d = Math.abs(b.offsetLeft + b.offsetWidth / 2 - cx); if (d < bd) { bd = d; best = b; } });
+      return best;
+    }
+    function relX(e) { var r = seg.getBoundingClientRect(); return e.clientX - r.left; }
+    seg.addEventListener('pointerdown', function (e) {
+      dragging = true; moved = false; seg.classList.add('press');
+      var on = seg.querySelector('button.on'); grab = Math.min(Math.max(relX(e) - (on.offsetLeft + on.offsetWidth / 2), -on.offsetWidth / 2), on.offsetWidth / 2);
+      grab = relX(e) - (on.offsetLeft + on.offsetWidth / 2) > on.offsetWidth / 2 || relX(e) - (on.offsetLeft + on.offsetWidth / 2) < -on.offsetWidth / 2 ? 0 : grab;
+      try { seg.setPointerCapture(e.pointerId); } catch (x) {}
     });
+    seg.addEventListener('pointermove', function (e) {
+      if (!dragging) return;
+      var x = relX(e) - grab - curW / 2, min = segBtns[0].offsetLeft, max = segBtns[segBtns.length - 1].offsetLeft + segBtns[segBtns.length - 1].offsetWidth - curW;
+      x = Math.max(min, Math.min(max, x));
+      if (Math.abs(x - curX) > 3) { moved = true; seg.classList.add('drag'); }
+      if (moved) {
+        thumb.style.setProperty('--x', x + 'px');
+        var b = nearest(x + curW / 2);
+        if (!b.classList.contains('on')) { segBtns.forEach(function (z) { z.classList.toggle('on', z === b); }); mode = b.dataset.v; if (navigator.vibrate) try { navigator.vibrate(6); } catch (e2) {} }
+      }
+    });
+    function release(e) {
+      if (!dragging) return; dragging = false;
+      var wasDrag = moved;
+      seg.classList.remove('press'); seg.classList.remove('drag');
+      var b = wasDrag ? seg.querySelector('button.on') : nearest(relX(e));
+      var changed = !b.classList.contains('on') || wasDrag;
+      select(b, changed);
+    }
+    seg.addEventListener('pointerup', release);
+    seg.addEventListener('pointercancel', function (e) { dragging = false; seg.classList.remove('press'); seg.classList.remove('drag'); moveThumb(); });
     window.addEventListener('resize', moveThumb);
     window.addEventListener('load', moveThumb);
     requestAnimationFrame(moveThumb);
