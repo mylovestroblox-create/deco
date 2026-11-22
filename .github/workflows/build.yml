@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       app_name:
-        description: "Название приложения"
+        description: "App name"
         required: true
         default: "deco"
       bundle_id:
-        description: "Bundle ID (например com.example.myapp)"
+        description: "Bundle ID (e.g. com.example.myapp)"
         required: true
         default: "com.deco.app"
       url:
-        description: "Ссылка на сайт (пусто = использовать папку site/ из репозитория)"
+        description: "Website URL (empty = use the site/ folder from the repo)"
         required: false
         default: ""
 
@@ -83,4 +83,4 @@ jobs:
         run: |
           gh release create "build-${{ github.run_number }}" app.ipa \
             --title "$APP_NAME (build ${{ github.run_number }})" \
-            --notes "Готовый IPA. Открой его в LiveContainer."
+            --notes "Ready-to-use IPA. Open it in LiveContainer."

@@ -1,10 +1,10 @@
 # deco
 
-iOS-приложение (`.ipa`) для деобфускации Lua/Luau. Всё работает офлайн внутри WebView.
+iOS app (`.ipa`) for deobfuscating Lua/Luau. Runs fully offline inside a WebView.
 
-Поддерживается: Prometheus, Clyde, LuaObfuscator.
+Supported: Prometheus, Clyde, LuaObfuscator. Detection only: Luraph, MoonSec V3, 77fuscator, IronBrew.
 
-## Сборка
+## Build
 
-Actions → Build IPA → Run workflow, введи название и bundle ID (ссылку на сайт оставь пустой).
-Готовый `app.ipa` появится в Releases и в Artifacts. Открой его в LiveContainer.
+Actions → Build IPA → Run workflow. Enter an app name and bundle ID (leave the site URL empty).
+The finished `app.ipa` appears in Releases. Open it in LiveContainer.

@@ -105,7 +105,7 @@ final class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
         let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(true) })
-        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel) { _ in completionHandler(false) })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(false) })
         present(alert, animated: true)
     }
 
@@ -117,7 +117,7 @@ final class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate
         alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
             completionHandler(alert.textFields?.first?.text)
         })
-        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel) { _ in completionHandler(nil) })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(nil) })
         present(alert, animated: true)
     }
 }
