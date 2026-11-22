@@ -311,7 +311,8 @@
       { name: 'Luraph', re: /protected using Luraph|lura\.ph|Luraph Obfuscator/i },
       { name: 'MoonSec V3', re: /protected with MoonSec|MoonSec V3/i },
       { name: '77fuscator', re: /77FUS\||77fuscator/i },
-      { name: 'IronBrew', re: /IronBrew|Iron Brew/i }
+      { name: 'IronBrew', re: /IronBrew|Iron Brew/i },
+      { name: 'Clyde v3 (register VM)', re: /^\s*return\s*\(function\(\.\.\.\)[\s\S]{0,400}bit32\.byteswap[\s\S]{0,400}\[=\[/ }
     ];
     function detect(s) {
       var found = [];
