@@ -35240,6 +35240,8095 @@ try {
 
 //export {luaminp as luamin};
 },{}],
+83:[function(module,exports,require,process){
+const { removeLuaObfuscatorBanner } = require("../transforms/banner.js");
+const { decodeXorStrings } = require("../transforms/decodeXorStrings.js");
+const { decodeLuaObfuscatorVm } = require("../transforms/decodeVmPayload.js");
+const { foldNumericNoise } = require("../transforms/foldNumericNoise.js");
+const { simplifySourceNoise } = require("../transforms/simplifySourceNoise.js");
+const { cleanupLua } = require("../transforms/cleanupLua.js");
+
+function deobfuscateLuaObfuscator(source, options = {}) {
+  const config = {
+    cleanup: options.cleanup !== false,
+    removeBanner: options.removeBanner !== false,
+    removeDecoder: options.removeDecoder !== false
+  };
+
+  const stats = {
+    decoders: [],
+    decodedStrings: 0,
+    foldedNumbers: 0,
+    simplifiedNoise: 0,
+    vmPayloads: 0,
+    vmDecodedBytes: 0,
+    vmInstructions: 0,
+    vmExpandedInstructions: 0,
+    vmPreservedInstructions: 0,
+    vmOutputMode: "source",
+    vmSuperinstructionError: null,
+    removedBanner: false,
+    removedDecoder: false
+  };
+
+  let code = source;
+
+  if (config.removeBanner) {
+    const result = removeLuaObfuscatorBanner(code);
+    code = result.code;
+    stats.removedBanner = result.removed;
+  }
+
+  const decoded = decodeXorStrings(code, {
+    removeDecoder: config.removeDecoder
+  });
+  code = decoded.code;
+  stats.decoders = decoded.decoders;
+  stats.decodedStrings = decoded.decodedStrings;
+  stats.removedDecoder = decoded.removedDecoder;
+
+  const vmDecoded = decodeLuaObfuscatorVm(code);
+  code = vmDecoded.code;
+  stats.vmPayloads = vmDecoded.decodedPayloads;
+  stats.vmDecodedBytes = vmDecoded.decodedBytes;
+  stats.vmInstructions = vmDecoded.instructionCount;
+  stats.vmExpandedInstructions = vmDecoded.expandedInstructionCount;
+  stats.vmPreservedInstructions = vmDecoded.preservedInstructions;
+  stats.vmOutputMode = vmDecoded.outputMode;
+  stats.vmSuperinstructionError = vmDecoded.superinstructionError;
+
+  if (config.cleanup) {
+    if (stats.vmPayloads === 0) {
+      for (let pass = 0; pass < 2; pass += 1) {
+        const simplified = simplifySourceNoise(code);
+        code = simplified.code;
+        stats.simplifiedNoise += simplified.simplified;
+
+        const folded = foldNumericNoise(code);
+        code = folded.code;
+        stats.foldedNumbers += folded.folded;
+      }
+
+      code = cleanupLua(code);
+    }
+  }
+
+  return { code, stats };
+}
+
+exports.deobfuscateLuaObfuscator = deobfuscateLuaObfuscator;
+
+},{"../transforms/banner.js":84,"../transforms/decodeXorStrings.js":85,"../transforms/decodeVmPayload.js":87,"../transforms/foldNumericNoise.js":90,"../transforms/simplifySourceNoise.js":91,"../transforms/cleanupLua.js":92}],
+84:[function(module,exports,require,process){
+function removeLuaObfuscatorBanner(source) {
+  const bannerPattern = /^\s*--\[\[[\s\S]*?LuaObfuscator\.com[\s\S]*?\]\]--\s*/;
+  const code = source.replace(bannerPattern, "");
+  return {
+    code,
+    removed: code !== source
+  };
+}
+
+exports.removeLuaObfuscatorBanner = removeLuaObfuscatorBanner;
+
+},{}],
+85:[function(module,exports,require,process){
+const { luaQuote, readLuaQuotedString } = require("../core/luaStrings.js");
+
+function findDecoderDefinitions(source) {
+  const definitions = [];
+  const functionPattern = /local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)/g;
+  let match;
+
+  while ((match = functionPattern.exec(source)) !== null) {
+    const start = match.index;
+    const bodyStart = functionPattern.lastIndex;
+    const end = findBalancedFunctionEnd(source, bodyStart);
+    if (end === -1) continue;
+
+    const text = source.slice(start, end);
+    const body = source.slice(bodyStart, end);
+
+    if (
+      /\bfor\b/.test(body) &&
+      /#\s*[A-Za-z_]/.test(body) &&
+      /%\s*(?:256|\()/.test(body) &&
+      /\breturn\b/.test(body)
+    ) {
+      definitions.push({
+        name: match[1],
+        start,
+        end,
+        text
+      });
+    }
+  }
+
+  return definitions;
+}
+
+function findBalancedFunctionEnd(source, bodyStart) {
+  let depth = 1;
+  let i = bodyStart;
+
+  while (i < source.length) {
+    const char = source[i];
+
+    if (char === '"' || char === "'") {
+      try {
+        i = readLuaQuotedString(source, i).end;
+      } catch {
+        return -1;
+      }
+      continue;
+    }
+
+    if (source.startsWith("--[[", i)) {
+      const end = source.indexOf("]]", i + 4);
+      i = end === -1 ? source.length : end + 2;
+      continue;
+    }
+
+    if (source.startsWith("--", i)) {
+      i = findLineCommentEnd(source, i + 2);
+      continue;
+    }
+
+    if (/[A-Za-z_]/.test(char)) {
+      let end = i + 1;
+      while (end < source.length && /[A-Za-z0-9_]/.test(source[end])) end += 1;
+      const word = source.slice(i, end);
+      if (word === "function" || word === "do" || word === "then" || word === "repeat") {
+        depth += 1;
+      } else if (word === "end" || word === "until") {
+        depth -= 1;
+        if (depth === 0) return end;
+      }
+      i = end;
+      continue;
+    }
+
+    i += 1;
+  }
+
+  return -1;
+}
+
+function findLineCommentEnd(source, startIndex) {
+  const lf = source.indexOf("\n", startIndex);
+  const cr = source.indexOf("\r", startIndex);
+  let end;
+  if (lf === -1) end = cr === -1 ? source.length : cr;
+  else if (cr === -1) end = lf;
+  else end = Math.min(lf, cr);
+  if (end >= source.length) return source.length;
+  return source[end] === "\r" && source[end + 1] === "\n" ? end + 2 : end + 1;
+}
+
+function decodeXor(dataBytes, keyBytes) {
+  if (keyBytes.length === 0) return dataBytes;
+
+  const out = [];
+  for (let i = 1; i <= dataBytes.length; i += 1) {
+    const dataByte = dataBytes[i - 1];
+    const keyByte = keyBytes[i % keyBytes.length];
+    out.push((dataByte ^ keyByte) & 0xff);
+  }
+  return out;
+}
+
+function skipSpace(source, index) {
+  let i = index;
+  while (i < source.length && /\s/.test(source[i])) i += 1;
+  return i;
+}
+
+function parseDecoderCall(source, index, decoderNames) {
+  for (const name of decoderNames) {
+    if (!source.startsWith(name, index)) continue;
+    const before = source[index - 1] ?? "";
+    const afterName = source[index + name.length] ?? "";
+    if (/[A-Za-z0-9_]/.test(before) || /[A-Za-z0-9_]/.test(afterName)) continue;
+
+    let i = skipSpace(source, index + name.length);
+    if (source[i] !== "(") continue;
+    i = skipSpace(source, i + 1);
+
+    const first = readLuaQuotedString(source, i);
+    if (!first) continue;
+    i = skipSpace(source, first.end);
+    if (source[i] !== ",") continue;
+    i = skipSpace(source, i + 1);
+
+    const second = readLuaQuotedString(source, i);
+    if (!second) continue;
+    i = skipSpace(source, second.end);
+    if (source[i] !== ")") continue;
+
+    return {
+      end: i + 1,
+      replacement: luaQuote(decodeXor(first.bytes, second.bytes))
+    };
+  }
+
+  return null;
+}
+
+function replaceDecoderCalls(source, decoderNames) {
+  let out = "";
+  let decodedStrings = 0;
+  let i = 0;
+
+  while (i < source.length) {
+    const char = source[i];
+
+    if (char === '"' || char === "'") {
+      let parsed;
+      try {
+        parsed = readLuaQuotedString(source, i);
+      } catch {
+        out += source.slice(i);
+        break;
+      }
+      out += parsed.raw;
+      i = parsed.end;
+      continue;
+    }
+
+    if (source.startsWith("--[[", i)) {
+      const end = source.indexOf("]]", i + 4);
+      const commentEnd = end === -1 ? source.length : end + 2;
+      out += source.slice(i, commentEnd);
+      i = commentEnd;
+      continue;
+    }
+
+    if (source.startsWith("--", i)) {
+      const commentEnd = findLineCommentEnd(source, i + 2);
+      out += source.slice(i, commentEnd);
+      i = commentEnd;
+      continue;
+    }
+
+    const call = parseDecoderCall(source, i, decoderNames);
+    if (call) {
+      out += call.replacement;
+      decodedStrings += 1;
+      i = call.end;
+      continue;
+    }
+
+    out += char;
+    i += 1;
+  }
+
+  return { code: out, decodedStrings };
+}
+
+function removeDecoderPrelude(source, definitions) {
+  if (definitions.length === 0) return { code: source, removed: false };
+
+  let code = source;
+  let removed = false;
+
+  for (const definition of [...definitions].sort((a, b) => b.start - a.start)) {
+    const stillUsed = new RegExp(`\\b${definition.name}\\s*\\(`).test(code.slice(0, definition.start) + code.slice(definition.end));
+    if (stillUsed) continue;
+
+    let start = definition.start;
+    const prefix = code.slice(Math.max(0, start - 260), start);
+    const aliasMatch = /local\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*string\.char\s*;[\s\S]*$/m.exec(prefix);
+    if (aliasMatch) start = Math.max(0, start - 260) + aliasMatch.index;
+
+    code = code.slice(0, start) + code.slice(definition.end).replace(/^\s*;?\s*/, "");
+    removed = true;
+  }
+
+  return { code, removed };
+}
+
+function decodeXorStrings(source, options = {}) {
+  const definitions = findDecoderDefinitions(source);
+  const decoderNames = [...new Set(definitions.map((definition) => definition.name))];
+
+  if (decoderNames.length === 0) {
+    return {
+      code: source,
+      decoders: [],
+      decodedStrings: 0,
+      removedDecoder: false
+    };
+  }
+
+  const replaced = replaceDecoderCalls(source, decoderNames);
+  const cleaned = options.removeDecoder === false
+    ? { code: replaced.code, removed: false }
+    : removeDecoderPrelude(replaced.code, definitions);
+
+  return {
+    code: cleaned.code,
+    decoders: decoderNames,
+    decodedStrings: replaced.decodedStrings,
+    removedDecoder: cleaned.removed
+  };
+}
+
+exports.decodeXorStrings = decodeXorStrings;
+
+},{"../core/luaStrings.js":86}],
+86:[function(module,exports,require,process){
+const simpleEscapes = new Map([
+  ["a", 7],
+  ["b", 8],
+  ["f", 12],
+  ["n", 10],
+  ["r", 13],
+  ["t", 9],
+  ["v", 11],
+  ["\\", 92],
+  ['"', 34],
+  ["'", 39]
+]);
+
+function readLuaQuotedString(source, startIndex) {
+  const quote = source[startIndex];
+  if (quote !== '"' && quote !== "'") return null;
+
+  const bytes = [];
+  let i = startIndex + 1;
+
+  while (i < source.length) {
+    const char = source[i];
+
+    if (char === quote) {
+      return {
+        bytes,
+        end: i + 1,
+        raw: source.slice(startIndex, i + 1)
+      };
+    }
+
+    if (char !== "\\") {
+      bytes.push(char.charCodeAt(0) & 0xff);
+      i += 1;
+      continue;
+    }
+
+    i += 1;
+    if (i >= source.length) break;
+
+    const escaped = source[i];
+    if (/[0-9]/.test(escaped)) {
+      let digits = escaped;
+      i += 1;
+      while (i < source.length && digits.length < 3 && /[0-9]/.test(source[i])) {
+        digits += source[i];
+        i += 1;
+      }
+      bytes.push(Number.parseInt(digits, 10) & 0xff);
+      continue;
+    }
+
+    if (escaped === "x" && /[0-9a-fA-F]/.test(source[i + 1] ?? "") && /[0-9a-fA-F]/.test(source[i + 2] ?? "")) {
+      bytes.push(Number.parseInt(source.slice(i + 1, i + 3), 16) & 0xff);
+      i += 3;
+      continue;
+    }
+
+    if (escaped === "z") {
+      i += 1;
+      while (i < source.length && /\s/.test(source[i])) i += 1;
+      continue;
+    }
+
+    bytes.push(simpleEscapes.get(escaped) ?? (escaped.charCodeAt(0) & 0xff));
+    i += 1;
+  }
+
+  throw new Error(`Unterminated Lua string at byte ${startIndex}`);
+}
+
+function luaQuote(bytes) {
+  if (bytes.some((byte) => byte >= 128)) {
+    const buffer = Buffer.from(bytes);
+    const text = buffer.toString("utf8");
+    if (Buffer.from(text, "utf8").equals(buffer)) {
+      return quoteUtf8Text(text);
+    }
+  }
+
+  let out = '"';
+  for (const byte of bytes) {
+    if (byte === 34) out += '\\"';
+    else if (byte === 92) out += "\\\\";
+    else if (byte === 10) out += "\\n";
+    else if (byte === 13) out += "\\r";
+    else if (byte === 9) out += "\\t";
+    else if (byte >= 32 && byte <= 126) out += String.fromCharCode(byte);
+    else out += `\\${byte.toString().padStart(3, "0")}`;
+  }
+  out += '"';
+  return out;
+}
+
+function quoteUtf8Text(text) {
+  let out = '"';
+  for (const char of text) {
+    const code = char.codePointAt(0);
+    if (char === '"') out += '\\"';
+    else if (char === "\\") out += "\\\\";
+    else if (char === "\n") out += "\\n";
+    else if (char === "\r") out += "\\r";
+    else if (char === "\t") out += "\\t";
+    else if (code >= 32 && code !== 127) out += char;
+    else {
+      for (const byte of Buffer.from(char, "utf8")) out += `\\${byte.toString().padStart(3, "0")}`;
+    }
+  }
+  out += '"';
+  return out;
+}
+
+function findLineCommentEnd(source, startIndex) {
+  const lf = source.indexOf("\n", startIndex);
+  const cr = source.indexOf("\r", startIndex);
+  let end;
+  if (lf === -1) end = cr === -1 ? source.length : cr;
+  else if (cr === -1) end = lf;
+  else end = Math.min(lf, cr);
+  if (end >= source.length) return source.length;
+  return source[end] === "\r" && source[end + 1] === "\n" ? end + 2 : end + 1;
+}
+
+function mapOutsideLuaStrings(source, mapper) {
+  let out = "";
+  let chunkStart = 0;
+  let i = 0;
+
+  while (i < source.length) {
+    const char = source[i];
+
+    if (char === '"' || char === "'") {
+      out += mapper(source.slice(chunkStart, i));
+      let parsed;
+      try {
+        parsed = readLuaQuotedString(source, i);
+      } catch {
+        out += source.slice(i);
+        return out;
+      }
+      out += parsed.raw;
+      i = parsed.end;
+      chunkStart = i;
+      continue;
+    }
+
+    if (source.startsWith("--[[", i)) {
+      out += mapper(source.slice(chunkStart, i));
+      const end = source.indexOf("]]", i + 4);
+      const commentEnd = end === -1 ? source.length : end + 2;
+      out += source.slice(i, commentEnd);
+      i = commentEnd;
+      chunkStart = i;
+      continue;
+    }
+
+    if (source.startsWith("--", i)) {
+      out += mapper(source.slice(chunkStart, i));
+      const commentEnd = findLineCommentEnd(source, i + 2);
+      out += source.slice(i, commentEnd);
+      i = commentEnd;
+      chunkStart = i;
+      continue;
+    }
+
+    i += 1;
+  }
+
+  out += mapper(source.slice(chunkStart));
+  return out;
+}
+
+exports.readLuaQuotedString = readLuaQuotedString;
+exports.luaQuote = luaQuote;
+exports.mapOutsideLuaStrings = mapOutsideLuaStrings;
+
+},{}],
+87:[function(module,exports,require,process){
+const { readLuaQuotedString, luaQuote } = require("../core/luaStrings.js");
+const {
+  analyzeSuperinstructionVm,
+  expandSuperinstructionProto
+} = require("../core/superinstructions.js");
+
+const OUTPUT_HEADER = "-- This file was deobfuscated by VX [ https://discord.gg/qa2fwcB7K ]";
+
+class ByteReader {
+  constructor(bytes) {
+    this.bytes = bytes;
+    this.offset = 0;
+  }
+
+  u8() {
+    if (this.offset >= this.bytes.length) throw new Error("Unexpected end of VM payload");
+    return this.bytes[this.offset++];
+  }
+
+  u16() {
+    return this.u8() + (this.u8() << 8);
+  }
+
+  u32() {
+    return this.u8() + (this.u8() << 8) + (this.u8() << 16) + (this.u8() * 0x1000000);
+  }
+
+  f64() {
+    if (this.offset + 8 > this.bytes.length) throw new Error("Unexpected end of VM payload");
+    const view = new DataView(this.bytes.buffer, this.bytes.byteOffset + this.offset, 8);
+    this.offset += 8;
+    return view.getFloat64(0, true);
+  }
+
+  string(length = null) {
+    const size = length ?? this.u32();
+    if (size === 0) return "";
+    if (this.offset + size > this.bytes.length) throw new Error("Unexpected end of VM string");
+    const bytes = this.bytes.slice(this.offset, this.offset + size);
+    this.offset += size;
+    return Buffer.from(bytes).toString("latin1");
+  }
+}
+
+function bitField(value, from, to = null) {
+  if (to !== null) {
+    const shifted = Math.floor(value / (2 ** (from - 1)));
+    const width = ((to - 1) - (from - 1)) + 1;
+    return Math.floor(shifted % (2 ** width));
+  }
+
+  const mask = 2 ** (from - 1);
+  return (value % (mask + mask)) >= mask ? 1 : 0;
+}
+
+function decodeEncodedVmString(encoded) {
+  if (!encoded.startsWith("LOL!")) {
+    throw new Error("Unsupported VM payload marker");
+  }
+
+  const body = encoded.slice(4);
+  const markerPair = body.match(/[0-9]([^0-9a-fA-F])/);
+  const marker = markerPair?.[1];
+  const out = [];
+  let repeat = null;
+
+  for (let i = 0; i < body.length; i += 2) {
+    const pair = body.slice(i, i + 2);
+    if (pair.length < 2) break;
+
+    if (marker && pair[1] === marker) {
+      repeat = Number.parseInt(pair[0], 10);
+      continue;
+    }
+
+    const byte = Number.parseInt(pair, 16);
+    if (!Number.isFinite(byte)) {
+      throw new Error(`Invalid VM payload byte: ${pair}`);
+    }
+
+    const count = repeat ?? 1;
+    for (let j = 0; j < count; j += 1) out.push(byte & 0xff);
+    repeat = null;
+  }
+
+  return Uint8Array.from(out);
+}
+
+function parseProto(reader, path = "0") {
+  const constants = [];
+  const constantCount = reader.u32();
+
+  for (let i = 1; i <= constantCount; i += 1) {
+    const type = reader.u8();
+    if (type === 1) constants[i] = reader.u8() !== 0;
+    else if (type === 2) constants[i] = reader.f64();
+    else if (type === 3) constants[i] = reader.string();
+    else constants[i] = null;
+  }
+
+  const parameterCount = reader.u8();
+  const instructions = [];
+  const instructionCount = reader.u32();
+
+  for (let pc = 1; pc <= instructionCount; pc += 1) {
+    const descriptor = reader.u8();
+    if (bitField(descriptor, 1, 1) !== 0) {
+      instructions.push({
+        pc,
+        descriptor,
+        skipped: true,
+        op: null,
+        a: null,
+        b: null,
+        c: null
+      });
+      continue;
+    }
+
+    const mode = bitField(descriptor, 2, 3);
+    const flags = bitField(descriptor, 4, 6);
+    const instruction = {
+      pc,
+      descriptor,
+      mode,
+      flags,
+      op: reader.u16(),
+      a: reader.u16(),
+      b: null,
+      c: null
+    };
+
+    if (mode === 0) {
+      instruction.b = reader.u16();
+      instruction.c = reader.u16();
+    } else if (mode === 1) {
+      instruction.b = reader.u32();
+    } else if (mode === 2) {
+      instruction.b = reader.u32() - 0x10000;
+    } else if (mode === 3) {
+      instruction.b = reader.u32() - 0x10000;
+      instruction.c = reader.u16();
+    }
+
+    if (bitField(flags, 1, 1) === 1) instruction.a = constants[instruction.a];
+    if (bitField(flags, 2, 2) === 1) instruction.b = constants[instruction.b];
+    if (bitField(flags, 3, 3) === 1) instruction.c = constants[instruction.c];
+
+    instructions.push(instruction);
+  }
+
+  const protos = [];
+  const protoCount = reader.u32();
+  for (let i = 0; i < protoCount; i += 1) {
+    protos.push(parseProto(reader, `${path}.${i}`));
+  }
+
+  return {
+    path,
+    constants: constants.slice(1),
+    parameterCount,
+    instructions,
+    protos
+  };
+}
+
+function collectConstants(proto, out = []) {
+  out.push(...proto.constants);
+  for (const child of proto.protos) collectConstants(child, out);
+  return out;
+}
+
+function luaValue(value) {
+  if (typeof value === "string") return luaQuote([...Buffer.from(value, "latin1")]);
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return "0/0";
+    if (value === Infinity) return "1/0";
+    if (value === -Infinity) return "-1/0";
+    return String(value);
+  }
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (value === null || value === undefined) return "nil";
+  return String(value);
+}
+
+function formatOperand(value) {
+  if (typeof value === "string") return luaValue(value);
+  if (value === null || value === undefined) return "_";
+  return String(value);
+}
+
+function formatInstruction(instruction) {
+  if (instruction.skipped) return `${String(instruction.pc).padStart(4, "0")}  <skipped descriptor=${instruction.descriptor}>`;
+  return [
+    String(instruction.pc).padStart(4, "0"),
+    `opcode=${instruction.op}`,
+    `A=${formatOperand(instruction.a)}`,
+    `B=${formatOperand(instruction.b)}`,
+    `C=${formatOperand(instruction.c)}`,
+    `mode=${instruction.mode}`,
+    `flags=${instruction.flags}`
+  ].join("  ");
+}
+
+function formatProto(proto, indent = "") {
+  const lines = [];
+  lines.push(`${indent}-- proto ${proto.path}: params=${proto.parameterCount}, constants=${proto.constants.length}, instructions=${proto.instructions.length}, children=${proto.protos.length}`);
+  if (proto.constants.length > 0) {
+    lines.push(`${indent}-- constants:`);
+    proto.constants.forEach((constant, index) => {
+      lines.push(`${indent}--   [${index + 1}] ${luaValue(constant)}`);
+    });
+  }
+  lines.push(`${indent}-- instructions:`);
+  for (const instruction of proto.instructions) {
+    lines.push(`${indent}--   ${formatInstruction(instruction)}`);
+  }
+  for (const child of proto.protos) {
+    lines.push(...formatProto(child, indent));
+  }
+  return lines;
+}
+
+function recoverLikelySource(proto) {
+  const lines = [];
+
+  function visit(current) {
+    const constants = current.constants.filter((value) => typeof value === "string");
+    const urls = constants.filter((value) => /^https?:\/\//i.test(value));
+    const hasLoadstring = constants.includes("loadstring");
+    const hasGame = constants.includes("game");
+    const httpGet = constants.find((value) => /^HttpGet$/i.test(value) || /HttpGet/.test(value));
+    if (hasLoadstring && hasGame && httpGet && urls.length > 0) {
+      for (const url of urls) {
+        lines.push(`loadstring(game:${httpGet}(${luaValue(url)}))()`);
+      }
+    }
+
+    const printable = constants.filter((value) => {
+      if (value === "print" || value === "string" || value === "match" || value === "tonumber" || value === "pcall") return false;
+      if (value === "loadstring" || value === "game" || value === httpGet) return false;
+      if (value === ":%d+:" || value === "%d+") return false;
+      if (/^https?:\/\//i.test(value)) return false;
+      return value.length > 0 && /[\w\s]/.test(value);
+    });
+
+    if (constants.includes("print")) {
+      for (const value of printable) {
+        lines.push(`print(${luaValue(value)})`);
+      }
+
+      const printableNumbers = current.constants.filter((value) => {
+        return typeof value === "number" && Number.isFinite(value) && value !== 1;
+      });
+      for (const value of printableNumbers) {
+        lines.push(`print(${luaValue(value)})`);
+      }
+    }
+
+    if (
+      current.protos.length === 0 &&
+      constants.length === 0 &&
+      current.constants.every((value) => typeof value === "number" || value === null || value === undefined)
+    ) {
+      lines.push("-- empty chunk");
+    }
+
+    for (const child of current.protos) visit(child);
+  }
+
+  visit(proto);
+  return [...new Set(lines)];
+}
+
+function recoverHighConfidenceSource(proto) {
+  const lines = [];
+
+  function visit(current) {
+    const constants = current.constants.filter((value) => typeof value === "string");
+    const urls = constants.filter((value) => /^https?:\/\//i.test(value));
+    const hasLoadstring = constants.includes("loadstring");
+    const hasGame = constants.includes("game");
+    const httpGet = constants.find((value) => /^HttpGet$/i.test(value) || /HttpGet/.test(value));
+    if (hasLoadstring && hasGame && httpGet && urls.length > 0) {
+      for (const url of urls) {
+        lines.push(`loadstring(game:${httpGet}(${luaValue(url)}))()`);
+      }
+    }
+
+    if (
+      current.protos.length === 0 &&
+      constants.length === 0 &&
+      current.constants.every((value) => typeof value === "number" || value === null || value === undefined)
+    ) {
+      lines.push("-- empty chunk");
+    }
+
+    for (const child of current.protos) visit(child);
+  }
+
+  visit(proto);
+  return [...new Set(lines)];
+}
+
+function isMostlyText(value) {
+  if (!value || value.length === 0) return false;
+
+  let printable = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code < 32 && code !== 9 && code !== 10 && code !== 13) return false;
+    if (code === 9 || code === 10 || code === 13 || (code >= 32 && code <= 126)) printable += 1;
+  }
+
+  return printable / value.length >= 0.75 && /[A-Za-z0-9_{}\[\]().,"\n]/.test(value);
+}
+
+function recoverDecodedWrapperStrings(proto) {
+  const decoded = [];
+
+  function visit(current) {
+    for (let i = 0; i < current.instructions.length - 2; i += 1) {
+      const data = current.instructions[i];
+      const key = current.instructions[i + 1];
+      const call = current.instructions[i + 2];
+      if (
+        data.skipped ||
+        key.skipped ||
+        call.skipped ||
+        data.mode !== 1 ||
+        key.mode !== 1 ||
+        data.flags !== 2 ||
+        key.flags !== 2 ||
+        typeof data.b !== "string" ||
+        typeof key.b !== "string" ||
+        data.b.length === 0 ||
+        key.b.length === 0 ||
+        call.c !== 2
+      ) {
+        continue;
+      }
+
+      const value = xorLuaBinaryString(data.b, key.b);
+      if (isMostlyText(value)) decoded.push(value);
+    }
+
+    for (const child of current.protos) visit(child);
+  }
+
+  visit(proto);
+  return [...new Set(decoded)];
+}
+
+function recoverDecodedConstantPairs(proto) {
+  const decoded = [];
+
+  function visit(current) {
+    for (let i = 0; i < current.constants.length - 1; i += 1) {
+      const data = current.constants[i];
+      const key = current.constants[i + 1];
+      if (
+        typeof data !== "string" ||
+        typeof key !== "string" ||
+        data.length === 0 ||
+        key.length === 0
+      ) {
+        continue;
+      }
+
+      const value = xorLuaBinaryString(data, key);
+      if (isMostlyText(value)) decoded.push(value);
+    }
+
+    for (const child of current.protos) visit(child);
+  }
+
+  visit(proto);
+  return [...new Set(decoded)];
+}
+
+function countOwnDecodedConstantPairs(proto) {
+  let count = 0;
+  for (let i = 0; i < proto.constants.length - 1; i += 1) {
+    const data = proto.constants[i];
+    const key = proto.constants[i + 1];
+    if (typeof data !== "string" || typeof key !== "string" || data.length === 0 || key.length === 0) continue;
+    if (isMostlyText(xorLuaBinaryString(data, key))) count += 1;
+  }
+  return count;
+}
+
+function looksEncodedBinaryString(value) {
+  if (typeof value !== "string") return false;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code < 32 || code > 126) return true;
+  }
+  return false;
+}
+
+function recoverOwnDecodedConstantMap(proto) {
+  const decoded = new Map();
+  for (let i = 0; i < proto.constants.length - 1; i += 1) {
+    const data = proto.constants[i];
+    const key = proto.constants[i + 1];
+    if (typeof data !== "string" || typeof key !== "string" || data.length === 0 || key.length === 0) continue;
+
+    const value = xorLuaBinaryString(data, key);
+    if (isMostlyText(value)) {
+      decoded.set(data, value);
+      if (looksEncodedBinaryString(key)) decoded.set(key, value);
+    }
+  }
+  return decoded;
+}
+
+function recoverInlineXorSource(proto) {
+  const constants = collectConstants(proto);
+  const decoded = recoverDecodedConstantPairs(proto);
+  if (decoded.length === 0) return null;
+
+  const lines = [];
+  const urls = decoded.filter((value) => /^https?:\/\//i.test(value));
+  const httpGet = constants.find((value) => typeof value === "string" && (/^HttpGet$/i.test(value) || /HttpGet/.test(value)));
+
+  if (constants.includes("loadstring") && constants.includes("game") && httpGet && urls.length > 0) {
+    for (const url of urls) lines.push(`loadstring(game:${httpGet}(${luaValue(url)}))()`);
+  }
+
+  if (constants.includes("print")) {
+    for (const value of decoded) {
+      if (/^https?:\/\//i.test(value)) continue;
+      if (value.length === 0) continue;
+      lines.push(`print(${luaValue(value)})`);
+    }
+  }
+
+  return lines.length > 0 ? [...new Set(lines)] : null;
+}
+
+function recoverDecodedWrapperStringMap(proto) {
+  const decoded = new Map();
+
+  function visit(current) {
+    for (let i = 0; i < current.instructions.length - 3; i += 1) {
+      const data = current.instructions[i];
+      const key = current.instructions[i + 1];
+      const call = current.instructions[i + 2];
+      const store = current.instructions[i + 3];
+      if (
+        data.skipped ||
+        key.skipped ||
+        call.skipped ||
+        store.skipped ||
+        data.mode !== 1 ||
+        key.mode !== 1 ||
+        data.flags !== 2 ||
+        key.flags !== 2 ||
+        typeof data.b !== "string" ||
+        typeof key.b !== "string" ||
+        data.b.length === 0 ||
+        key.b.length === 0 ||
+        call.c !== 2 ||
+        store.flags !== 2 ||
+        typeof store.b !== "number"
+      ) {
+        continue;
+      }
+
+      decoded.set(store.b, xorLuaBinaryString(data.b, key.b));
+    }
+
+    for (const child of current.protos) visit(child);
+  }
+
+  visit(proto);
+  return decoded;
+}
+
+function luaLongString(value) {
+  const normalized = String(value ?? "").replace(/\r\n/g, "\n");
+  let level = 0;
+  while (normalized.includes(`]${"=".repeat(level)}]`)) level += 1;
+  const marker = "=".repeat(level);
+  return `[${marker}[${normalized}]${marker}]`;
+}
+
+function recoverGamesenseClanTagSource(proto, decodedMap) {
+  const label = decodedMap.get(9);
+  const section = decodedMap.get(8);
+  const tab = decodedMap.get(7);
+  const event = decodedMap.get(1);
+  const constants = collectConstants(proto);
+  const hasClanTagApi = constants.includes("set_clan_tag") && constants.includes("new_checkbox");
+  if (label !== "Hitlur.lua" || section !== "Miscellaneous" || tab !== "Misc" || event !== "net_update_end" || !hasClanTagApi) {
+    return null;
+  }
+
+  const frames = proto.constants.filter((value) => {
+    return typeof value === "string" && (value.startsWith("\xe5\x8d\x90 ") || value.includes("Hitler"));
+  });
+  if (frames.length === 0) return null;
+
+  return [
+    `local enabled = ui.new_checkbox(${luaValue(tab)}, ${luaValue(section)}, ${luaValue(label)})`,
+    "local clantag_frames = {",
+    ...frames.map((frame) => `  ${luaValue(frame)},`),
+    "}",
+    "",
+    `client.set_event_callback(${luaValue(event)}, function()`,
+    "  if ui.get(enabled) then",
+    "    local frame = (math.floor(globals.tickcount() / 50) % #clantag_frames) + 1",
+    "    client.set_clan_tag(clantag_frames[frame])",
+    "  end",
+    "end)"
+  ];
+}
+
+function recoverGamesenseResolverSource(proto, decodedMap) {
+  const required = [
+    [112, "Resolver"],
+    [81, "JITTER"],
+    [75, "Force body yaw"],
+    [71, "Force body yaw value"],
+    [63, "net_update_end"],
+    [28, "m_angEyeAngles"],
+    [127, "m_flSimulationTime"]
+  ];
+  if (!required.every(([key, value]) => decodedMap.get(key) === value)) return null;
+  const constants = collectConstants(proto);
+  if (!constants.includes("register_esp_flag") || !constants.includes("new_checkbox")) return null;
+
+  const animStateStruct = decodedMap.get(137) ?? "";
+  const animLayerStruct = decodedMap.get(104) ?? "";
+  const clientDll = decodedMap.get(106) ?? "client.dll";
+  const entityListInterface = decodedMap.get(107) ?? "VClientEntityList003";
+  const clientEntityType = decodedMap.get(108) ?? "void*(__thiscall*)(void*, int)";
+  const voidTriplePtr = decodedMap.get(131) ?? "void***";
+  const charPtr = decodedMap.get(125) ?? "char*";
+  const tab = decodedMap.get(110) ?? "Rage";
+  const section = decodedMap.get(111) ?? "Other";
+  const checkboxLabel = decodedMap.get(112) ?? "Resolver";
+  const event = decodedMap.get(63) ?? "net_update_end";
+  const espFlag = decodedMap.get(81) ?? "JITTER";
+  const forceBodyYaw = decodedMap.get(75) ?? "Force body yaw";
+  const forceBodyYawValue = decodedMap.get(71) ?? "Force body yaw value";
+  const eyeAngles = decodedMap.get(28) ?? "m_angEyeAngles";
+  const simulationTime = decodedMap.get(127) ?? "m_flSimulationTime";
+
+  return [
+    `local ffi = require(${luaValue(decodedMap.get(116) ?? "ffi")})`,
+    `local vector = require(${luaValue(decodedMap.get(118) ?? "vector")})`,
+    "local tick_interval = globals.tickinterval()",
+    "",
+    `local animstate_t = ffi.typeof(${luaLongString(animStateStruct)})`,
+    `local animlayer_t = ffi.typeof(${luaLongString(animLayerStruct)})`,
+    "",
+    "local function NormalizeYaw(yaw)",
+    "  yaw = math.fmod(yaw + 180, 360)",
+    "  if yaw < 0 then",
+    "    yaw = yaw + 360",
+    "  end",
+    "  return yaw - 180",
+    "end",
+    "",
+    "local function ApproachAngle(target, value, speed)",
+    "  target = NormalizeYaw(target)",
+    "  value = NormalizeYaw(value)",
+    "  local delta = NormalizeYaw(target - value)",
+    "  if delta > speed then",
+    "    value = value + speed",
+    "  elseif delta < -speed then",
+    "    value = value - speed",
+    "  else",
+    "    value = target",
+    "  end",
+    "  return NormalizeYaw(value)",
+    "end",
+    "",
+    "local function AngleDiff(dest, src)",
+    "  return NormalizeYaw(dest - src)",
+    "end",
+    "",
+    "local function Lerp(a, b, t)",
+    "  return a + (b - a) * t",
+    "end",
+    "",
+    "function Clamp(value, min_value, max_value)",
+    "  return math.min(math.max(value, min_value), max_value)",
+    "end",
+    "",
+    "_G.Clamp = Clamp",
+    "",
+    "local function Round(value)",
+    "  return math.floor(value + 0.5)",
+    "end",
+    "",
+    "local function DegToRad(value)",
+    "  return value * math.pi / 180",
+    "end",
+    "",
+    "local function RadToDeg(value)",
+    "  return value * 180 / math.pi",
+    "end",
+    "",
+    "local function AngleMod(value)",
+    "  return bit.band(math.floor(value * 182.04444444444445), 65535) * 0.0054931640625",
+    "end",
+    "",
+    "local function AngleVector(pitch, yaw)",
+    "  local pitch_rad = math.rad(pitch)",
+    "  local yaw_rad = math.rad(yaw)",
+    "  local sin_pitch = math.sin(pitch_rad)",
+    "  local cos_pitch = math.cos(pitch_rad)",
+    "  local sin_yaw = math.sin(yaw_rad)",
+    "  local cos_yaw = math.cos(yaw_rad)",
+    "  return vector(cos_pitch * cos_yaw, cos_pitch * sin_yaw, -sin_pitch)",
+    "end",
+    "",
+    "local function VectorAngles(direction)",
+    "  local pitch = math.atan(-direction.z, direction:length2d()) * 57.2957795131",
+    "  local yaw = math.atan(direction.y, direction.x) * 57.2957795131",
+    "  if direction.x >= 0 then",
+    "    yaw = yaw + 180",
+    "  end",
+    "  return { x = pitch, y = yaw, z = 0 }",
+    "end",
+    "",
+    "local function MaxDesync(animstate)",
+    "  local speed_fraction = Clamp(animstate.feet_speed_forwards_or_sideways, 0, 1)",
+    "  local speed_factor = ((animstate.stop_to_full_running_fraction * -0.3) - 0.2) * speed_fraction + 1",
+    "  if animstate.duck_amount > 0 then",
+    "    speed_factor = speed_factor + animstate.duck_amount * speed_fraction * (0.5 - speed_factor)",
+    "  end",
+    "  return animstate.max_yaw * speed_factor",
+    "end",
+    "",
+    "local entity_list = client.create_interface(" + luaValue(clientDll) + ", " + luaValue(entityListInterface) + ")",
+    "local get_client_entity = ffi.cast(" +
+      `ffi.typeof(${luaValue(clientEntityType)}), ffi.cast(${luaValue(voidTriplePtr)}, entity_list)[0][3])`,
+    "",
+    "local function Bind(module_name, interface_name, index, typedef)",
+    "  local interface = client.create_interface(module_name, interface_name)",
+    "  local vtable = ffi.cast(" + luaValue(voidTriplePtr) + ", interface)",
+    "  return ffi.cast(ffi.typeof(typedef), vtable[0][index])",
+    "end",
+    "",
+    "_G.Bind = Bind",
+    "",
+    "local function EntityAddress(entindex)",
+    "  return get_client_entity(entity_list, entindex)",
+    "end",
+    "",
+    "local function AnimState(entindex)",
+    "  local entity = EntityAddress(entindex)",
+    "  if entity == nil then",
+    "    return nil",
+    "  end",
+    "  return ffi.cast(animstate_t, ffi.cast(" + luaValue(charPtr) + ", entity) + 39264)[0]",
+    "end",
+    "",
+    "local function AnimLayer(entindex, layer)",
+    "  local entity = EntityAddress(entindex)",
+    "  if entity == nil then",
+    "    return nil",
+    "  end",
+    "  local layers = ffi.cast(animlayer_t, ffi.cast(" + luaValue(charPtr) + ", entity))",
+    "  return layers[layer]",
+    "end",
+    "",
+    `local resolver_enabled = ui.new_checkbox(${luaValue(tab)}, ${luaValue(section)}, ${luaValue(checkboxLabel)})`,
+    "local player_records = {}",
+    "",
+    "local function NewRecord()",
+    "  return {",
+    "    Main = {",
+    "      Side = 0,",
+    "      Yaw = 0,",
+    "      Mode = 0,",
+    "      Diff = 0,",
+    "    },",
+    "    Jitter = {",
+    "      Active = false,",
+    "      Index = 0,",
+    "      Cache = {},",
+    "      Diff = 0,",
+    "    },",
+    "    Cache = {},",
+    "  }",
+    "end",
+    "",
+    "local function Record(entindex)",
+    "  local record = player_records[entindex]",
+    "  if record == nil then",
+    "    record = NewRecord()",
+    "    player_records[entindex] = record",
+    "  end",
+    "  return record",
+    "end",
+    "",
+    "local function UpdateJitter(entindex, record, animstate)",
+    `  local yaw = select(1, entity.get_prop(entindex, ${luaValue(eyeAngles)}))`,
+    "  if yaw == nil and animstate ~= nil then",
+    "    yaw = animstate.eye_angles_y",
+    "  end",
+    "  if yaw == nil then",
+    "    record.Jitter.Active = false",
+    "    return",
+    "  end",
+    "",
+    "  record.Jitter.Index = (record.Jitter.Index % 2) + 1",
+    "  record.Jitter.Cache[record.Jitter.Index] = yaw",
+    "",
+    "  local first = record.Jitter.Cache[1]",
+    "  local second = record.Jitter.Cache[2]",
+    "  if first ~= nil and second ~= nil then",
+    "    record.Jitter.Diff = math.abs(AngleDiff(first, second))",
+    "    record.Jitter.Active = record.Jitter.Diff > 35",
+    "  else",
+    "    record.Jitter.Diff = 0",
+    "    record.Jitter.Active = false",
+    "  end",
+    "end",
+    "",
+    "local function ResolvePlayer(entindex)",
+    "  local record = Record(entindex)",
+    `  local simtime = entity.get_prop(entindex, ${luaValue(simulationTime)})`,
+    "  if record.Cache.SimulationTime == simtime then",
+    "    return false",
+    "  end",
+    "  record.Cache.SimulationTime = simtime",
+    "",
+    "  local animstate = AnimState(entindex)",
+    "  if animstate == nil then",
+    "    record.Main.Mode = 0",
+    "    record.Main.Yaw = 0",
+    "    record.Jitter.Active = false",
+    "    return false",
+    "  end",
+    "",
+    "  UpdateJitter(entindex, record, animstate)",
+    "",
+    "  local side = record.Main.Side",
+    "  if side == 0 then",
+    "    side = 1",
+    "  end",
+    "  if record.Jitter.Active then",
+    "    side = -side",
+    "  end",
+    "",
+    "  local max_desync = MaxDesync(animstate)",
+    "  local yaw = record.Jitter.Active and record.Jitter.Diff or max_desync",
+    "  record.Main.Side = side",
+    "  record.Main.Yaw = Clamp(yaw * side, -60, 60)",
+    "  record.Main.Diff = yaw",
+    "  record.Main.Mode = record.Jitter.Active and 1 or 0",
+    "  return record.Main.Mode ~= 0",
+    "end",
+    "",
+    "local function ResetPlayer(entindex)",
+    "  local record = Record(entindex)",
+    "  record.Main.Mode = 0",
+    "  record.Main.Yaw = 0",
+    "  record.Jitter.Active = false",
+    `  plist.set(entindex, ${luaValue(forceBodyYaw)}, false)`,
+    "end",
+    "",
+    `client.set_event_callback(${luaValue(event)}, function()`,
+    "  local local_player = entity.get_local_player()",
+    "  if local_player == nil or not entity.is_alive(local_player) then",
+    "    return",
+    "  end",
+    "",
+    "  for _, entindex in pairs(entity.get_players(true)) do",
+    "    if ui.get(resolver_enabled) then",
+    "      local active = ResolvePlayer(entindex)",
+    "      local record = player_records[entindex]",
+    "      if active and record ~= nil then",
+    `        plist.set(entindex, ${luaValue(forceBodyYaw)}, true)`,
+    `        plist.set(entindex, ${luaValue(forceBodyYawValue)}, record.Main.Yaw)`,
+    "      else",
+    `        plist.set(entindex, ${luaValue(forceBodyYaw)}, false)`,
+    "      end",
+    "    else",
+    "      ResetPlayer(entindex)",
+    "    end",
+    "  end",
+    "end)",
+    "",
+    `client.register_esp_flag(${luaValue(espFlag)}, 200, 200, 200, function(entindex)`,
+    "  local record = player_records[entindex]",
+    "  return ui.get(resolver_enabled) and record ~= nil and record.Jitter.Active",
+    "end)"
+  ];
+}
+
+function recoverKnownGamesenseSource(proto) {
+  const decodedMap = recoverDecodedWrapperStringMap(proto);
+  if (decodedMap.size === 0) return null;
+
+  return recoverGamesenseClanTagSource(proto, decodedMap) ?? recoverGamesenseResolverSource(proto, decodedMap);
+}
+
+const SAMPLE_VM_SEMANTICS = {
+  0: "loadnil",
+  1: "getglobal",
+  2: "settable",
+  3: "tforloop",
+  4: "test_falsy",
+  5: "test_falsy",
+  6: "call1_multiret",
+  7: "call0_noret",
+  8: "call1_assign1",
+  9: "closure",
+  10: "call_var_assign1",
+  11: "return_one",
+  12: "concat",
+  13: "newtable",
+  14: "move",
+  15: "sub_k",
+  16: "not",
+  17: "call1_multiret",
+  18: "loadbool",
+  19: "testset_truthy",
+  20: "call_b_results",
+  21: "concat",
+  22: "jmp",
+  23: "loadbool",
+  24: "sub",
+  25: "div_kr",
+  26: "getupvalue",
+  27: "gettable_k",
+  28: "call_var_noret",
+  29: "not",
+  30: "call_b_results",
+  31: "closure",
+  32: "mul_k",
+  33: "eq_k_jump",
+  34: "settable",
+  35: "call0_multiret",
+  36: "return_varargs",
+  37: "loadnil",
+  38: "closure",
+  39: "call1_noret",
+  40: "return_varargs",
+  41: "return_nil",
+  42: "setlist",
+  43: "div_k",
+  44: "call_var_assign1",
+  45: "call0_multiret",
+  46: "test_truthy",
+  47: "move",
+  48: "lt_reg_jump",
+  49: "div_k",
+  50: "tforloop",
+  51: "jmp",
+  52: "call1_noret",
+  53: "settable_kc",
+  54: "closure",
+  55: "eq_reg_jump",
+  56: "setupvalue",
+  57: "return_nil",
+  58: "return_call0",
+  59: "lt_reg_jump",
+  60: "newtable",
+  61: "closure",
+  62: "settable_rk",
+  63: "ne_reg_jump",
+  64: "loadk",
+  65: "loadk",
+  66: "call1_results",
+  67: "testset_truthy",
+  68: "call_b_assign1",
+  69: "mul_k",
+  70: "call_var_noret",
+  71: "return_one",
+  72: "getupvalue",
+  73: "testset_falsy",
+  74: "gettable_r",
+  75: "self_k",
+  76: "div_kr",
+  77: "gettable_k",
+  78: "add",
+  79: "settable_k_const",
+  80: "return_varargs",
+  81: "call_b_assign1",
+  82: "settable_rk",
+  83: "getglobal",
+  84: "call_b_results",
+  85: "ne_k_jump",
+  86: "eq_reg_jump",
+  87: "call1_noret",
+  88: "call_var_results",
+  89: "call0_assign1",
+  90: "return_range",
+  91: "call_b_noret",
+  92: "return_call0",
+  93: "call_b_multiret",
+  94: "sub",
+  95: "mul",
+  96: "settable_r",
+  97: "self_k",
+  98: "testset_falsy",
+  99: "setlist",
+  100: "call_b_multiret",
+  101: "ne_k_jump",
+  102: "settable_r",
+  103: "call1_assign1",
+  104: "eq_k_jump",
+  105: "mul",
+  106: "gettable_r",
+  107: "setupvalue",
+  108: "ne_reg_jump",
+  109: "call0_assign1",
+  110: "call0_noret",
+  111: "return_nil",
+  112: "call_b_noret",
+  113: "add"
+};
+
+const CHAOTIC_EVIL_LARGE_VM_SEMANTICS = {
+  0: "le_reg_jump",
+  1: "call_var_results",
+  2: "call1_assign1",
+  3: "setupvalue",
+  4: "return_nil",
+  5: "return_one",
+  6: "setlist_range",
+  7: "div_k",
+  8: "call1_noret",
+  9: "getglobal",
+  10: "le_reg_jump",
+  11: "call_var_noret",
+  12: "call_b_multiret",
+  13: "call_b_assign1",
+  14: "self_k",
+  15: "call0_noret",
+  16: "mul_k",
+  17: "add_k",
+  18: "settable_r",
+  19: "eq_reg_jump",
+  20: "lt_kreg_jump",
+  21: "test_truthy",
+  22: "len",
+  23: "call_b_results",
+  24: "return_varargs",
+  25: "call0_assign1",
+  26: "test_falsy",
+  27: "eq_kreg_jump",
+  28: "call_var_results",
+  29: "return_two",
+  30: "concat",
+  31: "gettable_k",
+  32: "mod_k",
+  33: "settable_r",
+  34: "return_nil",
+  35: "call0_results",
+  36: "closure",
+  37: "loadbool",
+  38: "call1_results",
+  39: "closure",
+  40: "eq_k_jump",
+  41: "div",
+  42: "close",
+  43: "close",
+  44: "call0_noret",
+  45: "test_falsy",
+  46: "newtable",
+  47: "call_b_noret",
+  48: "return_call_b",
+  49: "add_kr",
+  50: "loadbool_skip",
+  51: "settable_k_const",
+  52: "mod",
+  53: "getupvalue",
+  54: "testset_falsy",
+  55: "return_varargs",
+  56: "setlist",
+  57: "le_kreg_jump",
+  58: "call_var_assign1",
+  59: "loadk",
+  60: "gettable_k",
+  61: "loadnil",
+  62: "lt_kreg_jump",
+  63: "settable_rk",
+  64: "append_varargs",
+  65: "testset_truthy",
+  66: "closure",
+  67: "call0_results",
+  68: "ne_reg_jump",
+  69: "call1_multiret",
+  70: "tforloop",
+  71: "concat",
+  72: "eq_kreg_jump",
+  73: "newtable",
+  74: "add_k",
+  75: "self_r",
+  76: "tforloop",
+  77: "len",
+  78: "close",
+  79: "lt_reg_jump",
+  80: "move",
+  81: "not",
+  82: "call1_multiret",
+  83: "call_var_noret",
+  84: "jmp",
+  85: "call_b_noret",
+  86: "forloop",
+  87: "loadbool_skip",
+  88: "self_r",
+  89: "closure",
+  90: "closure",
+  91: "call1_assign1",
+  92: "mod_k",
+  93: "return_call0",
+  94: "return_range",
+  95: "sub",
+  96: "return_call_b",
+  97: "test_truthy",
+  98: "return_two",
+  99: "mul_k",
+  100: "loadbool",
+  101: "sub",
+  102: "jmp",
+  103: "append_varargs",
+  104: "call_b_assign1",
+  105: "setlist",
+  106: "self_k",
+  107: "gettable_r",
+  108: "settable_rk",
+  109: "loadk",
+  110: "settable_k_const",
+  111: "testset_truthy",
+  112: "le_kreg_jump",
+  113: "call_b_results",
+  114: "forloop",
+  115: "call0_assign1",
+  116: "lt_reg_jump",
+  117: "settable_kr",
+  118: "mod",
+  119: "move",
+  120: "gettable_r",
+  121: "return_call0",
+  122: "call1_results",
+  123: "add_kr",
+  124: "testset_falsy",
+  125: "forprep",
+  126: "forprep",
+  127: "call1_noret",
+  128: "return_one",
+  129: "settable_kr",
+  130: "eq_k_jump",
+  131: "not",
+  132: "getglobal",
+  133: "div",
+  134: "getupvalue",
+  135: "ne_reg_jump",
+  136: "loadnil",
+  137: "eq_reg_jump",
+  138: "call_var_assign1",
+  139: "div_k"
+};
+
+const CHAOTIC_EVIL_CHAT_VM_SEMANTICS = {
+  0: "jmp",
+  1: "gettable_r",
+  2: "newtable",
+  3: "add_k",
+  4: "setupvalue",
+  5: "return_nil",
+  6: "add_k",
+  7: "lt_reg_jump",
+  8: "return_nil",
+  9: "le_kreg_jump",
+  10: "closure",
+  11: "call_b_noret",
+  12: "getupvalue",
+  13: "close",
+  14: "len",
+  15: "jmp",
+  16: "getglobal",
+  17: "loadk",
+  18: "call1_noret",
+  19: "move",
+  20: "close",
+  21: "gettable_r",
+  22: "self_k",
+  23: "le_kreg_jump",
+  24: "loadk",
+  25: "call_b_noret",
+  26: "len",
+  27: "call0_noret",
+  28: "newtable",
+  29: "setlist",
+  30: "closure",
+  31: "call0_noret",
+  32: "call1_noret",
+  33: "getglobal",
+  34: "gettable_k",
+  35: "getupvalue",
+  36: "lt_reg_jump",
+  37: "append_varargs",
+  38: "upvalue_marker",
+  39: "move",
+  40: "gettable_k",
+  41: "setupvalue"
+};
+
+const CHAOTIC_EVIL_INLINE_XOR_VM_SEMANTICS = {
+  3: "closure",
+  11: "settable_kr",
+  13: "jmp",
+  17: "loadk",
+  21: "getglobal",
+  26: "call_b_assign1",
+  30: "return_nil",
+  34: "newtable",
+  39: "upvalue_marker",
+  40: "move",
+  42: "testset_truthy",
+  44: "gettable_k",
+  46: "call1_noret"
+};
+
+const CHAOTIC_EVIL_INLINE_XOR_ALT_VM_SEMANTICS = {
+  8: "gettable_k",
+  9: "upvalue_marker",
+  12: "closure",
+  13: "testset_truthy",
+  17: "call_b_assign1",
+  20: "jmp",
+  23: "return_nil",
+  24: "call1_noret",
+  28: "newtable",
+  37: "settable_kr",
+  41: "loadk",
+  49: "getglobal",
+  51: "move"
+};
+
+const VM_SAMPLES_REMOTE_VM_SEMANTICS = {
+  0: "self_k",
+  4: "move",
+  7: "getglobal",
+  8: "call_b_noret",
+  10: "test_falsy",
+  11: "loadk",
+  13: "eq_k_jump",
+  14: "call_b_assign1",
+  17: "jmp",
+  18: "gettable_k"
+};
+
+const VM_SAMPLES_UI_VM_SEMANTICS = {
+  3: "upvalue_marker",
+  7: "loadbool",
+  8: "call_count_assign1",
+  9: "not",
+  12: "test_falsy",
+  23: "test_falsy",
+  25: "test_falsy",
+  32: "test_falsy",
+  36: "test_falsy",
+  41: "call_b_noret",
+  50: "gettable_k",
+  62: "move",
+  65: "call1_multiret",
+  69: "newtable",
+  71: "call_b_assign1",
+  73: "settable_k_const",
+  77: "settable_kc",
+  78: "tforloop",
+  79: "call_count_noret",
+  85: "sub",
+  86: "call_b_assign1",
+  92: "jmp",
+  100: "getglobal",
+  101: "loadk",
+  102: "test_falsy",
+  103: "return_nil",
+  107: "return_nil",
+  123: "loadbool",
+  124: "return_one",
+  126: "self_k",
+  128: "closure"
+};
+
+const VM_SAMPLES_BEE_DIRECT_VM_SEMANTICS = {
+  0: "close",
+  1: "lt_reg_jump",
+  3: "close",
+  4: "move",
+  6: "close",
+  7: "close",
+  8: "call_count_noret",
+  9: "loadk",
+  10: "test_falsy",
+  14: "close",
+  17: "close",
+  18: "settable_kc",
+  20: "add",
+  23: "concat",
+  24: "close",
+  27: "close",
+  28: "getglobal",
+  30: "jmp",
+  32: "call_count_assign1",
+  34: "add",
+  35: "move",
+  38: "call_count_noret",
+  39: "move",
+  43: "gettable_k",
+  45: "call_b_noret",
+  47: "call_count_assign1",
+  49: "move",
+  53: "settable_k_const",
+  54: "close",
+  55: "test_falsy",
+  60: "test_falsy",
+  66: "call_var_assign1",
+  67: "call_b_assign1",
+  71: "close",
+  72: "jmp",
+  74: "concat",
+  78: "settable_k_const",
+  79: "test_falsy",
+  80: "test_falsy",
+  81: "loadk",
+  83: "call_count_noret",
+  84: "close",
+  85: "jmp",
+  90: "closure",
+  91: "close",
+  92: "newtable",
+  93: "return_nil",
+  94: "call_b_multiret",
+  95: "self_k",
+  97: "call_count_assign1",
+  98: "close",
+  99: "concat",
+  100: "move"
+};
+
+const VM_SAMPLES_MM2_DIRECT_VM_SEMANTICS = {
+  1: "setlist",
+  3: "return_nil",
+  6: "close",
+  7: "close",
+  8: "gettable_k",
+  11: "close",
+  12: "test_falsy",
+  14: "test_falsy",
+  15: "self_k",
+  17: "call_b_noret",
+  20: "concat",
+  21: "add",
+  22: "move",
+  24: "close",
+  28: "setglobal",
+  29: "tforloop",
+  30: "return_nil",
+  31: "move",
+  32: "settable_k_const",
+  33: "newtable",
+  34: "newtable",
+  35: "jmp",
+  38: "newtable",
+  39: "move",
+  40: "test_falsy",
+  41: "test_falsy",
+  42: "jmp",
+  45: "test_falsy",
+  46: "test_falsy",
+  48: "test_falsy",
+  52: "newtable",
+  53: "test_falsy",
+  55: "test_falsy",
+  57: "add",
+  58: "call_count_assign1",
+  59: "settable_rk",
+  66: "add",
+  70: "gettable_r",
+  72: "jmp",
+  74: "loadbool",
+  75: "call_var_assign1",
+  76: "getglobal",
+  78: "loadk",
+  80: "call_count_noret",
+  84: "test_falsy",
+  85: "test_falsy",
+  86: "call_b_assign1",
+  93: "sub",
+  94: "closure",
+  95: "settable_kc",
+  97: "call_count_assign1",
+  100: "self_r"
+};
+
+const VM_SAMPLES_KEY_GUI_VM_SEMANTICS = {
+  3: "close",
+  6: "loadk",
+  8: "jmp",
+  9: "return_nil",
+  12: "move",
+  13: "call_b_noret",
+  14: "getglobal",
+  15: "self_k",
+  17: "return_nil",
+  18: "gettable_k",
+  20: "gettable_k",
+  21: "newtable",
+  22: "getglobal",
+  23: "loadk",
+  24: "call_b_noret",
+  25: "loadk",
+  26: "settable_k_const",
+  28: "call_b_noret",
+  33: "gettable_k",
+  34: "gettable_k",
+  35: "settable_kc",
+  36: "closure",
+  37: "test_falsy",
+  40: "gettable_k",
+  42: "move",
+  43: "gettable_k",
+  44: "gettable_k",
+  46: "getglobal",
+  47: "gettable_k",
+  48: "gettable_k",
+  49: "getglobal",
+  51: "move",
+  53: "return_nil",
+  54: "getglobal",
+  56: "test_falsy",
+  57: "loadk",
+  58: "test_falsy",
+  59: "call_b_assign1",
+  60: "settable_k_const",
+  61: "loadk",
+  63: "gettable_k",
+  64: "test_falsy"
+};
+
+const VM_SAMPLES_SMALL_UI_VM_SEMANTICS = {
+  4: "settable_k_const",
+  6: "test_falsy",
+  9: "newtable",
+  11: "test_falsy",
+  12: "settable_kc",
+  19: "add",
+  22: "call_count_noret",
+  25: "jmp",
+  27: "loadk",
+  29: "return_nil",
+  30: "closure",
+  34: "call_b_noret",
+  35: "move",
+  36: "getglobal",
+  37: "newtable",
+  38: "self_k",
+  39: "call_b_assign1",
+  40: "test_falsy",
+  42: "test_falsy",
+  45: "sub",
+  46: "move",
+  47: "move",
+  48: "call_b_noret",
+  50: "test_falsy",
+  51: "call_b_assign1",
+  52: "close",
+  53: "loadbool",
+  56: "return_nil",
+  57: "call_b_assign1",
+  59: "move",
+  60: "test_falsy"
+};
+
+const VM_SAMPLES_PLAYER_UI_VM_SEMANTICS = {
+  2: "call_b_noret",
+  3: "getglobal",
+  4: "closure",
+  5: "gettable_k",
+  6: "loadk",
+  7: "move",
+  8: "test_falsy",
+  9: "loadk",
+  10: "test_falsy",
+  11: "call_count_assign1",
+  12: "test_falsy",
+  13: "jmp",
+  15: "test_falsy",
+  16: "test_falsy",
+  18: "newtable",
+  19: "gettable_k",
+  20: "call_count_assign1",
+  21: "test_falsy",
+  23: "call_count_noret",
+  24: "loadk",
+  25: "test_falsy",
+  26: "settable_k_const",
+  28: "closure",
+  29: "newtable",
+  30: "call_b_noret",
+  32: "settable_kc",
+  33: "newtable",
+  34: "return_nil",
+  35: "settable_k_const",
+  36: "self_k",
+  37: "self_k",
+  38: "getglobal",
+  40: "test_falsy",
+  43: "add",
+  45: "test_falsy",
+  46: "return_nil",
+  47: "getglobal",
+  48: "gettable_k",
+  49: "loadk",
+  50: "test_falsy",
+  51: "call_b_noret"
+};
+
+const KNOWN_GLOBALS = new Set([
+  "_G",
+  "_ENV",
+  "assert",
+  "bit",
+  "bit32",
+  "CFrame",
+  "client",
+  "collectgarbage",
+  "Color3",
+  "coroutine",
+  "database",
+  "debug",
+  "dofile",
+  "entity",
+  "Enum",
+  "error",
+  "ffi",
+  "filesystem",
+  "game",
+  "getfenv",
+  "getgenv",
+  "globals",
+  "http",
+  "identifyexecutor",
+  "Instance",
+  "ipairs",
+  "isfile",
+  "isfolder",
+  "json",
+  "loadstring",
+  "makefolder",
+  "math",
+  "materials",
+  "next",
+  "os",
+  "pairs",
+  "panorama",
+  "pcall",
+  "plist",
+  "print",
+  "rawequal",
+  "rawget",
+  "rawlen",
+  "rawset",
+  "renderer",
+  "request",
+  "require",
+  "script",
+  "setclipboard",
+  "setfenv",
+  "setmetatable",
+  "spawn",
+  "string",
+  "surface",
+  "table",
+  "task",
+  "tonumber",
+  "tostring",
+  "type",
+  "typeof",
+  "UDim",
+  "UDim2",
+  "ui",
+  "unpack",
+  "Vector2",
+  "Vector3",
+  "vector",
+  "wait",
+  "workspace",
+  "writefile"
+]);
+
+const METHOD_NAMES = new Set([
+  "AddButton",
+  "AddDropdown",
+  "AddInput",
+  "AddParagraph",
+  "AddTab",
+  "AddToggle",
+  "CaptureController",
+  "ClickButton2",
+  "Clone",
+  "Connect",
+  "CreateButton",
+  "CreateSection",
+  "CreateTab",
+  "CreateToggle",
+  "CreateWindow",
+  "Destroy",
+  "Disconnect",
+  "FireServer",
+  "FindFirstAncestor",
+  "FindFirstChild",
+  "FindFirstChildOfClass",
+  "FindFirstChildWhichIsA",
+  "GetAttribute",
+  "GetAttributeChangedSignal",
+  "GetChildren",
+  "GetDescendants",
+  "GetMouse",
+  "GetObjects",
+  "GetPlayers",
+  "GetPropertyChangedSignal",
+  "GetService",
+  "HttpGet",
+  "IsA",
+  "IsAncestorOf",
+  "IsDescendantOf",
+  "LoadAnimation",
+  "NewSection",
+  "NewWindow",
+  "Notify",
+  "OnChanged",
+  "PivotTo",
+  "Play",
+  "SetAttribute",
+  "SetCore",
+  "SetValue",
+  "Wait",
+  "WaitForChild",
+  "WorldToViewportPoint"
+]);
+
+function classifyPolyDirectInstruction(instruction) {
+  const { mode, flags, b, c } = instruction;
+  if (mode === 1 && flags === 2) return KNOWN_GLOBALS.has(b) ? "getglobal" : "loadk";
+  if (mode === 0 && flags === 4 && typeof c === "string") return METHOD_NAMES.has(c) ? "self_k" : "gettable_k";
+  if (mode === 0 && flags === 4 && c !== null && c !== undefined) return "gettable_k";
+  if (mode === 0 && flags === 2 && b !== null && b !== undefined) return "settable_kc";
+  if (mode === 0 && flags === 6 && b !== null && b !== undefined) return "settable_k_const";
+  if (mode === 0 && flags === 0 && c === 0) return b === 0 ? "call_var_results" : "call_b_multiret";
+  if (mode === 0 && flags === 0 && c === 1) return b === 0 ? "call_var_noret" : typeof b === "number" && b < instruction.a + 1 ? "call_count_noret" : "call_b_noret";
+  if (mode === 0 && flags === 0 && c === 2) return b === 0 ? "call_var_assign1" : typeof b === "number" && b < instruction.a + 1 ? "call_count_assign1" : "call_b_assign1";
+  return null;
+}
+
+function collectInstructionList(proto, out = []) {
+  out.push(...proto.instructions.filter((instruction) => !instruction.skipped));
+  for (const child of proto.protos) collectInstructionList(child, out);
+  return out;
+}
+
+function hasDirectOperandShape(instruction) {
+  if (instruction.mode === 1 && instruction.flags === 2) return true;
+  return instruction.mode === 0 && [2, 4, 6].includes(instruction.flags);
+}
+
+function looksLikeCatalogTableVm(proto) {
+  if (proto.protos.length !== 0) return false;
+  if (!hasAllConstants(proto.constants, ["id", "lastupdated", "name", "price"])) return false;
+
+  const loadCount = proto.instructions.filter((instruction) => instruction.op === 15 && instruction.mode === 1 && instruction.flags === 2).length;
+  const fieldSetCount = proto.instructions.filter((instruction) => instruction.op === 16 && instruction.mode === 0 && instruction.flags === 2).length;
+  const inlineSetCount = proto.instructions.filter((instruction) => instruction.op === 2 && instruction.mode === 0 && instruction.flags === 6).length;
+  return loadCount + inlineSetCount > 100 && fieldSetCount + inlineSetCount > 100;
+}
+
+function buildCatalogTableProfile(proto) {
+  if (!looksLikeCatalogTableVm(proto)) return null;
+  return {
+    semantics: {
+      0: "setlist",
+      2: "settable_k_const",
+      4: "return_nil",
+      6: "setlist",
+      12: "newtable",
+      13: "return_one",
+      15: "loadk",
+      16: "settable_kc"
+    },
+    upvalueMarkerOps: new Set(),
+    nestedWrapper: false,
+    genericDirect: true,
+    allowLowConfidenceLift: true
+  };
+}
+
+function collectOpcodeStats(proto) {
+  const opcodes = new Set();
+  let instructionCount = 0;
+  let highestOpcode = -Infinity;
+
+  (function visit(current) {
+    for (const instruction of current.instructions) {
+      if (instruction.skipped) continue;
+      instructionCount += 1;
+      opcodes.add(instruction.op);
+      if (typeof instruction.op === "number") highestOpcode = Math.max(highestOpcode, instruction.op);
+    }
+    for (const child of current.protos) visit(child);
+  })(proto);
+
+  return {
+    instructionCount,
+    distinctOpcodes: opcodes.size,
+    highestOpcode
+  };
+}
+
+function inferGenericClosureOps(proto) {
+  const candidates = new Map();
+
+  (function visit(current) {
+    for (const instruction of current.instructions) {
+      if (instruction.skipped || instruction.mode !== 3 || instruction.flags !== 0) continue;
+
+      const candidate = candidates.get(instruction.op) ?? { total: 0, validChild: 0 };
+      candidate.total += 1;
+      if (
+        Number.isInteger(instruction.b) &&
+        instruction.b >= 0 &&
+        instruction.b < current.protos.length &&
+        Number.isInteger(instruction.c) &&
+        instruction.c >= 0
+      ) {
+        candidate.validChild += 1;
+      }
+      candidates.set(instruction.op, candidate);
+    }
+
+    for (const child of current.protos) visit(child);
+  })(proto);
+
+  return new Set(
+    [...candidates]
+      .filter(([, candidate]) => candidate.total >= 2 && candidate.validChild === candidate.total)
+      .map(([op]) => op)
+  );
+}
+
+function classifyGenericDirectInstruction(instruction, proto, closureOps = new Set()) {
+  const { mode, flags, b, c } = instruction;
+
+  if (mode === 1 && flags === 2) return KNOWN_GLOBALS.has(b) ? "getglobal" : "loadk";
+  if (mode === 0 && flags === 4 && typeof c === "string") return METHOD_NAMES.has(c) ? "self_k" : "gettable_k";
+  if (mode === 0 && flags === 2 && b !== null && b !== undefined) return "settable_kc";
+  if (mode === 0 && flags === 6 && b !== null && b !== undefined) return "settable_k_const";
+  if (mode === 3 && flags === 0 && closureOps.has(instruction.op) && typeof b === "number" && proto?.protos?.[b]) {
+    return "closure";
+  }
+  if (mode === 0 && flags === 0 && c === 0) return b === 0 ? "call_var_results" : "call_b_multiret";
+  if (mode === 0 && flags === 0 && c === 1) return b === 0 ? "call_var_noret" : typeof b === "number" && b < instruction.a + 1 ? "call_count_noret" : "call_b_noret";
+  if (mode === 0 && flags === 0 && c === 2) return b === 0 ? "call_var_assign1" : typeof b === "number" && b < instruction.a + 1 ? "call_count_assign1" : "call_b_assign1";
+
+  return null;
+}
+
+function buildGenericDirectProfile(proto) {
+  const catalogProfile = buildCatalogTableProfile(proto);
+  if (catalogProfile) return catalogProfile;
+
+  const instructions = collectInstructionList(proto);
+  if (instructions.length < 20) return null;
+
+  const directShapeCount = instructions.filter(hasDirectOperandShape).length;
+  const stringLoadCount = instructions.filter((instruction) => instruction.mode === 1 && instruction.flags === 2 && typeof instruction.b === "string").length;
+  const propertyAccessCount = instructions.filter((instruction) => instruction.mode === 0 && instruction.flags === 4 && typeof instruction.c === "string").length;
+  const propertyWriteCount = instructions.filter((instruction) => instruction.mode === 0 && [2, 6].includes(instruction.flags) && typeof instruction.b === "string").length;
+  const directRatio = directShapeCount / instructions.length;
+
+  if (stringLoadCount < 6 || propertyAccessCount + propertyWriteCount < 6 || directRatio < 0.18) return null;
+
+  const closureOps = inferGenericClosureOps(proto);
+  const opcodeStats = collectOpcodeStats(proto);
+  const preserveVmIr =
+    opcodeStats.instructionCount >= 1000 &&
+    opcodeStats.highestOpcode > 128 &&
+    opcodeStats.distinctOpcodes > 96;
+
+  return {
+    semantics: {},
+    kindForInstruction: (instruction, currentProto) => {
+      return classifyGenericDirectInstruction(instruction, currentProto, closureOps);
+    },
+    upvalueMarkerOps: new Set(),
+    nestedWrapper: false,
+    genericDirect: true,
+    suppressUnknown: false,
+    preferDispatcherAnalysis: true,
+    preserveVmIr,
+    opcodeStats
+  };
+}
+
+const XOR_DECODER_SEMANTIC_SEQUENCE = [
+  "newtable",
+  "loadk",
+  "len",
+  "loadk",
+  "forprep",
+  "getupvalue",
+  "move",
+  "getupvalue",
+  "getupvalue",
+  "getupvalue",
+  "getupvalue",
+  "move",
+  "move",
+  "add_k",
+  "call_b_multiret",
+  "call_var_assign1",
+  "getupvalue",
+  "getupvalue",
+  "move",
+  "len",
+  "mod",
+  "add_kr",
+  "len",
+  "mod",
+  "add_kr",
+  "add_k",
+  "call_b_multiret",
+  "call_var_results",
+  "call_var_assign1",
+  "mod_k",
+  "call1_multiret",
+  "call_var_noret",
+  "forloop",
+  "getupvalue",
+  "move",
+  "return_call_b",
+  "return_varargs",
+  "return_nil"
+];
+
+function maxOpcode(proto) {
+  let max = -Infinity;
+  for (const instruction of proto.instructions) {
+    if (!instruction.skipped && typeof instruction.op === "number") max = Math.max(max, instruction.op);
+  }
+  for (const child of proto.protos) max = Math.max(max, maxOpcode(child));
+  return max;
+}
+
+function countInstructions(proto) {
+  let count = proto.instructions.length;
+  for (const child of proto.protos) count += countInstructions(child);
+  return count;
+}
+
+function inferSemanticMap(proto) {
+  return inferVmProfile(proto).semantics;
+}
+
+function hasAllConstants(constants, values) {
+  return values.every((value) => constants.includes(value));
+}
+
+function firstInstructionWithValue(proto, slot, value) {
+  return proto.instructions.find((instruction) => !instruction.skipped && instruction[slot] === value);
+}
+
+function profileMatchesConstantLoad(proto, semantics, value, kind) {
+  const instruction = firstInstructionWithValue(proto, "b", value);
+  return instruction && semantics[instruction.op] === kind;
+}
+
+function addSemantic(semantics, op, kind, force = false) {
+  if (typeof op !== "number") return;
+  if (force || !semantics[op]) semantics[op] = kind;
+}
+
+function addOpcodeSemantic(semantics, instruction, kind, force = false) {
+  if (instruction?.op === 0) return;
+  addSemantic(semantics, instruction?.op, kind, force);
+}
+
+function buildXorWrapperProfile(proto) {
+  const decoder = proto.protos.find((child) => isLikelyXorDecoderProto(child));
+  if (!decoder) return null;
+
+  const semantics = {};
+  const upvalueMarkerOps = new Set();
+  const decoderInstructions = decoder.instructions.filter((instruction) => !instruction.skipped);
+  for (let i = 0; i < Math.min(decoderInstructions.length, XOR_DECODER_SEMANTIC_SEQUENCE.length); i += 1) {
+    addOpcodeSemantic(semantics, decoderInstructions[i], XOR_DECODER_SEMANTIC_SEQUENCE[i]);
+  }
+
+  const root = proto.instructions.filter((instruction) => !instruction.skipped);
+  for (const instruction of root) {
+    if (["string", "bit32", "bit", "table"].includes(instruction.b)) addOpcodeSemantic(semantics, instruction, "getglobal", true);
+    if (["char", "byte", "sub", "bxor", "concat", "insert"].includes(instruction.c)) {
+      addOpcodeSemantic(semantics, instruction, "gettable_k", true);
+    }
+  }
+
+  const bit32Index = root.findIndex((instruction) => instruction.b === "bit32");
+  if (bit32Index >= 0) {
+    addOpcodeSemantic(semantics, root[bit32Index + 1], "testset_truthy", true);
+    addOpcodeSemantic(semantics, root[bit32Index + 2], "jmp", true);
+  }
+
+  for (let i = 0; i < root.length; i += 1) {
+    const instruction = root[i];
+    if (typeof instruction.b === "number" && proto.protos[instruction.b] && instruction.mode === 3) {
+      addOpcodeSemantic(semantics, instruction, "closure", true);
+      const count = instruction.c ?? 0;
+      for (let j = 1; j <= count; j += 1) {
+        const marker = root[i + j];
+        if (!marker) continue;
+        addOpcodeSemantic(semantics, marker, "upvalue_marker", true);
+        upvalueMarkerOps.add(marker.op);
+      }
+      i += count;
+    }
+  }
+
+  for (let i = 3; i < root.length; i += 1) {
+    const move = root[i - 3];
+    const data = root[i - 2];
+    const key = root[i - 1];
+    const call = root[i];
+    const store = root[i + 1];
+    if (
+      semantics[move?.op] === "move" &&
+      semantics[data?.op] === "loadk" &&
+      semantics[key?.op] === "loadk" &&
+      typeof data.b === "string" &&
+      typeof key.b === "string" &&
+      call.a === move.a &&
+      call.c === 2
+    ) {
+      addOpcodeSemantic(semantics, call, "call_b_assign1", true);
+      if (store) addOpcodeSemantic(semantics, store, "settable_kr", true);
+    }
+  }
+
+  const methodNames = new Set([
+    "AddButton",
+    "AddDropdown",
+    "AddTextbox",
+    "AddToggle",
+    "Connect",
+    "CreateSection",
+    "CreateTab",
+    "CreateWindow",
+    "FireServer",
+    "FindFirstChild",
+    "GetPlayers",
+    "GetService",
+    "PivotTo",
+    "SetCore",
+    "WaitForChild",
+    "WorldToViewportPoint"
+  ]);
+  const allInstructions = [];
+  (function collectInstructions(current) {
+    allInstructions.push(...current.instructions.filter((instruction) => !instruction.skipped));
+    for (const child of current.protos) collectInstructions(child);
+  })(proto);
+
+  for (const instruction of allInstructions) {
+    if (typeof instruction.c === "string" && methodNames.has(instruction.c)) {
+      addOpcodeSemantic(semantics, instruction, "self_k");
+    }
+  }
+
+  for (const instruction of allInstructions) {
+    if (semantics[instruction.op]) continue;
+    if (instruction.mode === 0 && instruction.flags === 0 && instruction.c === 1 && typeof instruction.b === "number") {
+      addOpcodeSemantic(semantics, instruction, instruction.b < instruction.a + 1 ? "call_count_noret" : "call_b_noret");
+    } else if (
+      instruction.mode === 0 &&
+      bitField(instruction.flags, 3, 3) === 1 &&
+      bitField(instruction.flags, 2, 2) === 0 &&
+      typeof instruction.b === "number"
+    ) {
+      addOpcodeSemantic(semantics, instruction, "settable_rk");
+    } else if (
+      instruction.mode === 0 &&
+      instruction.flags === 0 &&
+      typeof instruction.b === "number" &&
+      typeof instruction.c === "number" &&
+      instruction.a !== 0
+    ) {
+      const previous = allInstructions.find((candidate) => candidate.pc === instruction.pc - 1);
+      if (previous && bitField(previous.flags ?? 0, 3, 3) === 1) addOpcodeSemantic(semantics, instruction, "settable_r");
+    }
+  }
+
+  return {
+    semantics,
+    kindForInstruction: (instruction, currentProto) => {
+      if (instruction.mode === 3 && typeof instruction.b === "number" && currentProto?.protos?.[instruction.b]) return "closure";
+      if (instruction.op === 0 || hasDirectOperandShape(instruction)) return classifyGenericDirectInstruction(instruction, currentProto);
+      return null;
+    },
+    upvalueMarkerOps,
+    nestedWrapper: true,
+    allowLowConfidenceLift: true
+  };
+}
+
+function inferVmProfile(proto) {
+  const constants = collectConstants(proto);
+  const max = maxOpcode(proto);
+  const looksLikeFullChaoticVm = constants.includes("GetService") && constants.includes("Players") && max > 100;
+  const looksLikeNestedChaoticEvil = hasAllConstants(constants, [
+    "char",
+    "byte",
+    "sub",
+    "bxor",
+    "concat",
+    "insert",
+    "match",
+    "tonumber",
+    "pcall"
+  ]) && max > 130;
+  const looksLikeAnyXorWrapper = hasAllConstants(constants, [
+    "char",
+    "byte",
+    "sub",
+    "bxor",
+    "concat",
+    "insert"
+  ]) && proto.protos.some((child) => isLikelyXorDecoderProto(child));
+  const looksLikeChatPunishPayload = constants.includes("SayMessageRequest") && max <= 50;
+  const looksLikeInlineXorWrapper = hasAllConstants(constants, [
+    "char",
+    "byte",
+    "sub",
+    "bxor",
+    "concat",
+    "insert",
+    "print"
+  ]) && max <= 60;
+  const looksLikeRemoteSample = hasAllConstants(constants, ["NoobiesGot", "FireServer", "ReplicatedStorage"]) && max <= 20;
+  const looksLikeUiSample = hasAllConstants(constants, ["GetObjects", "CreateWindow", "Nebulua"]) && max <= 130;
+  const looksLikeBeeDirectVm = hasAllConstants(constants, [
+    "beeconloaded",
+    "APIToken",
+    "VigenereKey",
+    "TrueEndpoint",
+    "FalseEndpoint"
+  ]) && max <= 100;
+  const looksLikeMm2DirectVm = hasAllConstants(constants, ["webHook", "build_games5", "CreateEmbed", "SendWebhook"]) && max <= 100;
+  const looksLikeKeyGuiVm = hasAllConstants(constants, ["Legends Handles Key System", "Enter Key...", "Correct Key!"]) && max <= 70;
+  const looksLikeSmallUiVm = hasAllConstants(constants, ["GET LOTS OF MONEY", "LOOP MONEY (IRREVERSIBLE)", "TELEPORT TO END (WORLD 1 ONLY)"]) && max <= 70;
+  const looksLikePlayerUiVm = hasAllConstants(constants, ["NewWindow", "spawn players", "CreateToggle", "cpy yt"]) && max <= 60;
+
+  if (looksLikeRemoteSample) {
+    return {
+      semantics: VM_SAMPLES_REMOTE_VM_SEMANTICS,
+      upvalueMarkerOps: new Set(),
+      nestedWrapper: false
+    };
+  }
+
+  if (looksLikeUiSample) {
+    return {
+      semantics: VM_SAMPLES_UI_VM_SEMANTICS,
+      upvalueMarkerOps: new Set([3]),
+      nestedWrapper: false
+    };
+  }
+
+  if (looksLikeBeeDirectVm) {
+    return {
+      semantics: VM_SAMPLES_BEE_DIRECT_VM_SEMANTICS,
+      upvalueMarkerOps: new Set(),
+      nestedWrapper: false
+    };
+  }
+
+  if (looksLikeMm2DirectVm) {
+    return {
+      semantics: VM_SAMPLES_MM2_DIRECT_VM_SEMANTICS,
+      upvalueMarkerOps: new Set(),
+      nestedWrapper: false
+    };
+  }
+
+  if (looksLikeKeyGuiVm) {
+    return {
+      semantics: VM_SAMPLES_KEY_GUI_VM_SEMANTICS,
+      kindForInstruction: (instruction) => instruction.op === 0 ? classifyPolyDirectInstruction(instruction) : null,
+      upvalueMarkerOps: new Set(),
+      nestedWrapper: false
+    };
+  }
+
+  if (looksLikeSmallUiVm) {
+    return {
+      semantics: VM_SAMPLES_SMALL_UI_VM_SEMANTICS,
+      kindForInstruction: (instruction) => instruction.op === 0 ? classifyPolyDirectInstruction(instruction) : null,
+      upvalueMarkerOps: new Set(),
+      nestedWrapper: false
+    };
+  }
+
+  if (looksLikePlayerUiVm) {
+    return {
+      semantics: VM_SAMPLES_PLAYER_UI_VM_SEMANTICS,
+      kindForInstruction: (instruction) => instruction.op === 0 ? classifyPolyDirectInstruction(instruction) : null,
+      upvalueMarkerOps: new Set(),
+      nestedWrapper: false
+    };
+  }
+
+  if (looksLikeNestedChaoticEvil && profileMatchesConstantLoad(proto, CHAOTIC_EVIL_LARGE_VM_SEMANTICS, "string", "getglobal")) {
+    return {
+      semantics: CHAOTIC_EVIL_LARGE_VM_SEMANTICS,
+      upvalueMarkerOps: new Set([80]),
+      nestedWrapper: true
+    };
+  }
+
+  if (looksLikeAnyXorWrapper) {
+    const dynamicProfile = buildXorWrapperProfile(proto);
+    if (dynamicProfile && Object.keys(dynamicProfile.semantics).length > 0) return dynamicProfile;
+  }
+
+  if (looksLikeChatPunishPayload) {
+    return {
+      semantics: CHAOTIC_EVIL_CHAT_VM_SEMANTICS,
+      upvalueMarkerOps: new Set([38]),
+      nestedWrapper: false
+    };
+  }
+
+  if (looksLikeInlineXorWrapper) {
+    const usesAltInlineMap = proto.instructions[0]?.op !== 34;
+    return {
+      semantics: usesAltInlineMap ? CHAOTIC_EVIL_INLINE_XOR_ALT_VM_SEMANTICS : CHAOTIC_EVIL_INLINE_XOR_VM_SEMANTICS,
+      upvalueMarkerOps: new Set(usesAltInlineMap ? [9] : [39]),
+      nestedWrapper: false
+    };
+  }
+
+  if (looksLikeFullChaoticVm && profileMatchesConstantLoad(proto, SAMPLE_VM_SEMANTICS, "game", "getglobal")) {
+    return {
+      semantics: SAMPLE_VM_SEMANTICS,
+      upvalueMarkerOps: new Set([14]),
+      nestedWrapper: false
+    };
+  }
+
+  const genericDirectProfile = buildGenericDirectProfile(proto);
+  if (genericDirectProfile) return genericDirectProfile;
+
+  return {
+    semantics: {},
+    upvalueMarkerOps: new Set(),
+    nestedWrapper: false
+  };
+}
+
+function registerName(index) {
+  if (typeof index !== "number") return `r[${luaValue(index)}]`;
+  return `r[${index}]`;
+}
+
+function upvalueName(index) {
+  if (typeof index !== "number") return `u[${luaValue(index)}]`;
+  return `u[${index}]`;
+}
+
+function label(pc) {
+  return `L${pc}`;
+}
+
+function rangeArgs(start, endExpression) {
+  return `unpack(r, ${start}, ${endExpression})`;
+}
+
+function jumpTarget(instruction) {
+  return typeof instruction.b === "number" ? instruction.b + 1 : instruction.b;
+}
+
+function instructionFieldValue(instruction, field) {
+  if (field === 2) return instruction.a;
+  if (field === 3) return instruction.b;
+  if (field === 4) return instruction.c;
+  return null;
+}
+
+function renderBranchOperand(operand, instruction) {
+  const value = instructionFieldValue(instruction, operand.field);
+  return operand.type === "register" ? registerName(value) : luaValue(value);
+}
+
+function renderBranchCondition(branch, instruction) {
+  const left = renderBranchOperand(branch.left, instruction);
+  if (branch.operator === "truthy") return left;
+  if (branch.operator === "falsy") return `not ${left}`;
+  return `${left} ${branch.operator} ${renderBranchOperand(branch.right, instruction)}`;
+}
+
+function branchActionTarget(action, instruction) {
+  return action === "advance" ? instruction.pc + 2 : jumpTarget(instruction);
+}
+
+function emitInstruction(instruction, semantics, proto) {
+  if (instruction.skipped) return [`-- skipped descriptor ${instruction.descriptor}`];
+
+  const kind = instruction.kind ?? semantics[instruction.op];
+  const a = instruction.a;
+  const b = instruction.b;
+  const c = instruction.c;
+
+  switch (kind) {
+    case "loadnil":
+      return [`for i = ${a}, ${b} do r[i] = nil end`];
+    case "getglobal":
+      return [`${registerName(a)} = env[${luaValue(b)}]`];
+    case "setglobal":
+      return [`env[${luaValue(b)}] = ${registerName(a)}`];
+    case "getupvalue":
+      return [`${registerName(a)} = get_upvalue(${luaValue(b)})`];
+    case "setupvalue":
+      return [`set_upvalue(${luaValue(b)}, ${registerName(a)})`];
+    case "loadk":
+      return [`${registerName(a)} = ${luaValue(b)}`];
+    case "loadbool":
+    case "loadbool_skip":
+      return [`${registerName(a)} = ${b ? "true" : "false"}`];
+    case "move":
+      return [`${registerName(a)} = ${registerName(b)}`];
+    case "newtable":
+      return [`${registerName(a)} = {}`];
+    case "gettable_k":
+      return [`${registerName(a)} = ${registerName(b)}[${luaValue(c)}]`];
+    case "gettable_r":
+      return [`${registerName(a)} = ${registerName(b)}[${registerName(c)}]`];
+    case "self_k":
+      return [
+        `${registerName(a + 1)} = ${registerName(b)}`,
+        `${registerName(a)} = ${registerName(b)}[${luaValue(c)}]`
+      ];
+    case "self_r":
+      return [
+        `${registerName(a + 1)} = ${registerName(b)}`,
+        `${registerName(a)} = ${registerName(b)}[${registerName(c)}]`
+      ];
+    case "settable_kc":
+      return [`${registerName(a)}[${luaValue(b)}] = ${registerName(c)}`];
+    case "settable_k_const":
+      return [`${registerName(a)}[${luaValue(b)}] = ${luaValue(c)}`];
+    case "settable_r":
+      return [`${registerName(a)}[${registerName(b)}] = ${registerName(c)}`];
+    case "settable_rk":
+      return [`${registerName(a)}[${registerName(b)}] = ${luaValue(c)}`];
+    case "settable_kr":
+      return [`${registerName(a)}[${luaValue(b)}] = ${registerName(c)}`];
+    case "add":
+      return [`${registerName(a)} = ${registerName(b)} + ${registerName(c)}`];
+    case "add_k":
+      return [`${registerName(a)} = ${registerName(b)} + ${luaValue(c)}`];
+    case "add_kr":
+      return [`${registerName(a)} = ${luaValue(b)} + ${registerName(c)}`];
+    case "sub":
+      return [`${registerName(a)} = ${registerName(b)} - ${registerName(c)}`];
+    case "sub_k":
+      return [`${registerName(a)} = ${registerName(b)} - ${luaValue(c)}`];
+    case "mul":
+      return [`${registerName(a)} = ${registerName(b)} * ${registerName(c)}`];
+    case "mul_k":
+      return [`${registerName(a)} = ${registerName(b)} * ${luaValue(c)}`];
+    case "div_k":
+      return [`${registerName(a)} = ${registerName(b)} / ${luaValue(c)}`];
+    case "div_kr":
+      return [`${registerName(a)} = ${luaValue(b)} / ${registerName(c)}`];
+    case "div":
+      return [`${registerName(a)} = ${registerName(b)} / ${registerName(c)}`];
+    case "div_kk":
+      return [`${registerName(a)} = ${luaValue(b)} / ${luaValue(c)}`];
+    case "mod":
+      return [`${registerName(a)} = ${registerName(b)} % ${registerName(c)}`];
+    case "mod_k":
+      return [`${registerName(a)} = ${registerName(b)} % ${luaValue(c)}`];
+    case "unm":
+      return [`${registerName(a)} = -${registerName(b)}`];
+    case "not":
+      return [`${registerName(a)} = not ${registerName(b)}`];
+    case "len":
+      return [`${registerName(a)} = #${registerName(b)}`];
+    case "concat":
+      return [`do local value = ${registerName(b)}; for i = ${b + 1}, ${c} do value = value .. r[i] end; ${registerName(a)} = value end`];
+    case "jmp":
+      return [`goto ${label(jumpTarget(instruction))}`];
+    case "branch": {
+      const condition = renderBranchCondition(instruction.branch, instruction);
+      const trueTarget = branchActionTarget(instruction.branch.trueAction, instruction);
+      const falseTarget = branchActionTarget(instruction.branch.falseAction, instruction);
+      return [`if ${condition} then goto ${label(trueTarget)} else goto ${label(falseTarget)} end`];
+    }
+    case "eq_k_jump":
+      return [`if ${registerName(a)} == ${luaValue(c)} then goto ${label(instruction.pc + 1)} else goto ${label(b)} end`];
+    case "ne_k_jump":
+      return [`if ${registerName(a)} ~= ${luaValue(c)} then goto ${label(instruction.pc + 1)} else goto ${label(b)} end`];
+    case "eq_reg_jump":
+      return [`if ${registerName(a)} == ${registerName(c)} then goto ${label(instruction.pc + 1)} else goto ${label(b)} end`];
+    case "ne_reg_jump":
+      return [`if ${registerName(a)} ~= ${registerName(c)} then goto ${label(instruction.pc + 1)} else goto ${label(b)} end`];
+    case "lt_reg_jump":
+      return [`if ${a} < ${registerName(c)} then goto ${label(instruction.pc + 1)} else goto ${label(b)} end`];
+    case "test_truthy":
+      return [`if ${registerName(a)} then goto ${label(instruction.pc + 1)} else goto ${label(b)} end`];
+    case "testset_truthy":
+      return [`if ${registerName(c)} then ${registerName(a)} = ${registerName(c)}; goto ${label(jumpTarget(instruction))} else goto ${label(instruction.pc + 2)} end`];
+    case "testset_falsy":
+      return [`if ${registerName(c)} then goto ${label(instruction.pc + 2)} else ${registerName(a)} = ${registerName(c)}; goto ${label(jumpTarget(instruction))} end`];
+    case "call0_noret":
+      return [`${registerName(a)}()`];
+    case "call1_noret":
+      return [`${registerName(a)}(${registerName(a + 1)})`];
+    case "call_b_noret":
+      return [`${registerName(a)}(${rangeArgs(a + 1, b)})`];
+    case "call_count_noret":
+      return [`${registerName(a)}(${rangeArgs(a + 1, a + b - 1)})`];
+    case "call_var_noret":
+      return [`${registerName(a)}(${rangeArgs(a + 1, "top")})`];
+    case "call0_assign1":
+      return [`${registerName(a)} = ${registerName(a)}()`];
+    case "call1_assign1":
+      return [`${registerName(a)} = ${registerName(a)}(${registerName(a + 1)})`];
+    case "call_b_assign1":
+      return [`${registerName(a)} = ${registerName(a)}(${rangeArgs(a + 1, b)})`];
+    case "call_count_assign1":
+      return [`${registerName(a)} = ${registerName(a)}(${rangeArgs(a + 1, a + b - 1)})`];
+    case "call_var_assign1":
+      return [`${registerName(a)} = ${registerName(a)}(${rangeArgs(a + 1, "top")})`];
+    case "call1_multiret":
+      return [
+        `do local out = pack(${registerName(a)}(${registerName(a + 1)})); top = ${a} + out.n - 1; for i = 1, out.n do r[${a} + i - 1] = out[i] end end`
+      ];
+    case "call_b_multiret":
+      return [
+        `do local out = pack(${registerName(a)}(${rangeArgs(a + 1, b)})); top = ${a} + out.n - 1; for i = 1, out.n do r[${a} + i - 1] = out[i] end end`
+      ];
+    case "call0_multiret":
+      return [
+        `do local out = pack(${registerName(a)}()); top = ${a} + out.n - 1; for i = 1, out.n do r[${a} + i - 1] = out[i] end end`
+      ];
+    case "call_b_results":
+      return [
+        `do local out = {${registerName(a)}(${rangeArgs(a + 1, b)})}; for i = 0, ${c - a} do r[${a} + i] = out[i + 1] end end`
+      ];
+    case "call1_results":
+      return [
+        `do local out = {${registerName(a)}(${registerName(a + 1)})}; for i = 0, ${c - a} do r[${a} + i] = out[i + 1] end end`
+      ];
+    case "call_var_results":
+      return [
+        `do local out = {${registerName(a)}(${rangeArgs(a + 1, "top")})}; for i = 0, ${c - a} do r[${a} + i] = out[i + 1] end end`
+      ];
+    case "return_nil":
+      return ["do return end"];
+    case "return_one":
+      return [`do return ${registerName(a)} end`];
+    case "return_call0":
+      return [`do return ${registerName(a)}() end`];
+    case "return_call_b":
+      return [`do return ${registerName(a)}(${rangeArgs(a + 1, b)}) end`];
+    case "return_varargs":
+      return [`do return ${rangeArgs(a, "top")} end`];
+    case "return_range":
+      return [`do return ${rangeArgs(a, a + b)} end`];
+    case "append_varargs":
+      return [`for i = ${a + 1}, top do table.insert(${registerName(a)}, r[i]) end`];
+    case "setlist":
+      return [`for i = 1, ${b} do ${registerName(a)}[i] = r[${a} + i] end`];
+    case "setlist_range":
+      return [`for i = ${a + 1}, ${b} do table.insert(${registerName(a)}, r[i]) end`];
+    case "closure":
+      if (typeof b !== "number") return [`-- closure target unavailable: child=${formatOperand(b)}`];
+      return [
+        `${registerName(a)} = protos[${luaValue(`${proto.path.replace(/\./g, "_")}_${b}`)}](env, {`,
+        ...(instruction.captures ?? []).map((capture, index) => {
+          const value = capture.source === "register"
+            ? `capture_register(${capture.index})`
+            : `capture_upvalue(${capture.index})`;
+          return `  [${index}] = ${value},`;
+        }),
+        "})"
+      ];
+    case "close":
+      return [`close_upvalues(${a})`];
+    case "forprep":
+      return [
+        `do local index = ${registerName(a)}; local limit = ${registerName(a + 1)}; local step = ${registerName(a + 2)}; if (step > 0 and index > limit) or (step <= 0 and index < limit) then goto ${label(jumpTarget(instruction))} else ${registerName(a + 3)} = index end end`
+      ];
+    case "forloop":
+      return [
+        `do local step = ${registerName(a + 2)}; local index = ${registerName(a)} + step; ${registerName(a)} = index; if (step > 0 and index <= ${registerName(a + 1)}) or (step <= 0 and index >= ${registerName(a + 1)}) then ${registerName(a + 3)} = index; goto ${label(jumpTarget(instruction))} end end`
+      ];
+    case "tforloop":
+      return [
+        `do local out = {${registerName(a)}(${registerName(a + 1)}, ${registerName(a + 2)})}; for i = 1, ${c} do r[${a + 2} + i] = out[i] end; if out[1] then ${registerName(a + 2)} = out[1]; goto ${label(jumpTarget(instruction))} else goto ${label(instruction.pc + 2)} end end`
+      ];
+    case "skipped":
+      return [`-- skipped descriptor ${instruction.descriptor}`];
+    default:
+      return [`-- vm ${formatInstruction(instruction)}`];
+  }
+}
+
+function emitRegisterProto(proto, semantics, lines) {
+  for (const child of proto.protos) emitRegisterProto(child, semantics, lines);
+
+  const functionName = proto.path.replace(/\./g, "_");
+  const existingLabels = new Set(proto.instructions.map((instruction) => instruction.pc));
+  const extraLabels = new Set([0]);
+
+  for (const instruction of proto.instructions) {
+    const kind = instruction.kind ?? semantics[instruction.op];
+    const targets = [];
+    if (["jmp", "forprep", "forloop", "tforloop", "testset_truthy", "testset_falsy"].includes(kind)) {
+      targets.push(jumpTarget(instruction));
+    } else if (kind === "branch") {
+      targets.push(
+        branchActionTarget(instruction.branch.trueAction, instruction),
+        branchActionTarget(instruction.branch.falseAction, instruction)
+      );
+    } else if (
+      [
+        "eq_k_jump",
+        "ne_k_jump",
+        "eq_reg_jump",
+        "ne_reg_jump",
+        "lt_reg_jump",
+        "test_truthy"
+      ].includes(kind)
+    ) {
+      targets.push(instruction.b, instruction.pc + 1);
+    }
+
+    for (const target of targets) {
+      if (typeof target === "number" && !existingLabels.has(target)) extraLabels.add(target);
+    }
+  }
+
+  lines.push(`protos[${luaValue(functionName)}] = function(env, u)`);
+  lines.push("  env = env or _ENV");
+  lines.push("  u = u or {}");
+  lines.push("  return function(...)");
+  lines.push("    local r = {}");
+  lines.push("    local args = {...}");
+  lines.push("    local argc = select('#', ...) - 1");
+  lines.push("    local varargs = {}");
+  lines.push("    local top = -1");
+  lines.push("    local open_upvalues = {}");
+  lines.push("    local function pack(...) return { n = select('#', ...), ... } end");
+  lines.push("    local function capture_register(index)");
+  lines.push("      local cell = open_upvalues[index]");
+  lines.push("      if cell == nil then");
+  lines.push("        cell = {}");
+  lines.push("        cell.get = function() return r[index] end");
+  lines.push("        cell.set = function(value) r[index] = value end");
+  lines.push("        open_upvalues[index] = cell");
+  lines.push("      end");
+  lines.push("      return cell");
+  lines.push("    end");
+  lines.push("    local function capture_upvalue(index)");
+  lines.push("      if u[index] == nil then u[index] = new_closed_cell(nil) end");
+  lines.push("      return u[index]");
+  lines.push("    end");
+  lines.push("    local function get_upvalue(index) return capture_upvalue(index).get() end");
+  lines.push("    local function set_upvalue(index, value) capture_upvalue(index).set(value) end");
+  lines.push("    local function close_upvalues(first)");
+  lines.push("      for index, cell in pairs(open_upvalues) do");
+  lines.push("        if index >= first then");
+  lines.push("          local value = cell.get()");
+  lines.push("          local closed = value");
+  lines.push("          cell.get = function() return closed end");
+  lines.push("          cell.set = function(next_value) closed = next_value end");
+  lines.push("          open_upvalues[index] = nil");
+  lines.push("        end");
+  lines.push("      end");
+  lines.push("    end");
+  lines.push("    for i = 0, argc do");
+  lines.push(`      if i >= ${proto.parameterCount} then varargs[i - ${proto.parameterCount}] = args[i + 1] else r[i] = args[i + 1] end`);
+  lines.push("    end");
+  lines.push("");
+  if (extraLabels.has(0)) lines.push(`    ::${label(0)}::`);
+
+  for (const instruction of proto.instructions) {
+    lines.push(`    ::${label(instruction.pc)}::`);
+    for (const emitted of emitInstruction(instruction, semantics, proto)) {
+      lines.push(`    ${emitted}`);
+    }
+  }
+
+  for (const extra of [...extraLabels].filter((value) => value !== 0).sort((a, b) => a - b)) {
+    lines.push(`    ::${label(extra)}::`);
+    lines.push("    do end");
+  }
+
+  lines.push("  end");
+  lines.push("end");
+  lines.push("");
+}
+
+function isConstOperand(instruction, slot) {
+  const bit = slot === "a" ? 1 : slot === "b" ? 2 : 3;
+  return bitField(instruction.flags ?? 0, bit, bit) === 1;
+}
+
+function isIdentifier(value) {
+  return typeof value === "string" &&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(value) &&
+    !LUA_KEYWORDS.has(value);
+}
+
+const LUA_KEYWORDS = new Set([
+  "and",
+  "break",
+  "do",
+  "else",
+  "elseif",
+  "end",
+  "false",
+  "for",
+  "function",
+  "goto",
+  "if",
+  "in",
+  "local",
+  "nil",
+  "not",
+  "or",
+  "repeat",
+  "return",
+  "then",
+  "true",
+  "until",
+  "while"
+]);
+
+function isDirectPrefixExpression(expr) {
+  const trimmed = expr.trim();
+  const root = /^[A-Za-z_][A-Za-z0-9_]*/.exec(trimmed)?.[0];
+  if (!root || LUA_KEYWORDS.has(root)) return false;
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)|(?:\[[^\n]+\]))*$/.test(trimmed);
+}
+
+function propertyAccess(base, key) {
+  const target = prefixExpr(base);
+  if (isIdentifier(key)) return `${target}.${key}`;
+  return `${target}[${luaValue(key)}]`;
+}
+
+function prefixExpr(expr) {
+  const text = typeof expr === "string" && expr.trim() && expr.trim() !== "()"
+    ? expr
+    : "nil";
+  const trimmed = text.trim();
+  if (!/\n/.test(text) && (isDirectPrefixExpression(trimmed) || (trimmed.startsWith("(") && trimmed.endsWith(")")))) {
+    return text;
+  }
+  return `(${text})`;
+}
+
+function commentSource(text) {
+  return String(text)
+    .split("\n")
+    .map((line) => `-- ${line}`)
+    .join("\n");
+}
+
+function inlineCommentExpression(value, maxLength = 180) {
+  const text = String(value ?? "nil").replace(/\s+/g, " ").trim() || "nil";
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+}
+
+function makeExpr(expr, extra = {}) {
+  return { expr, ...extra };
+}
+
+function cloneExpr(value) {
+  if (!value) return null;
+  return { ...value };
+}
+
+function xorLuaBinaryString(data, key) {
+  if (!key || key.length === 0) return data;
+  let out = "";
+  for (let i = 1; i <= data.length; i += 1) {
+    const dataByte = data.charCodeAt(i - 1) & 0xff;
+    const keyByte = key.charCodeAt(i % key.length) & 0xff;
+    out += String.fromCharCode((dataByte ^ keyByte) & 0xff);
+  }
+  return out;
+}
+
+function immediateExpr(value) {
+  return makeExpr(luaValue(value), { constant: value });
+}
+
+function renderExpr(value, indent = "", seen = new Set()) {
+  if (!value) return "nil";
+  if (value.table) return renderTable(value.table, indent, seen);
+  if (value.func) return renderFunction(value.func, indent);
+  return typeof value.expr === "string" && value.expr.trim() ? value.expr : "nil";
+}
+
+function renderTable(table, indent = "", seen = new Set()) {
+  if (table.entries.length === 0) return "{}";
+  if (seen.has(table)) return "{ --[[ recursive table ]] }";
+  seen.add(table);
+  const childIndent = `${indent}  `;
+  const lines = ["{"];
+  for (const entry of table.entries) {
+    const key = entry.keyExpr
+      ? `[${renderExpr(entry.keyExpr, childIndent, seen)}] = `
+      : entry.key === null
+      ? ""
+      : isIdentifier(entry.key)
+        ? `${entry.key} = `
+        : `[${luaValue(entry.key)}] = `;
+    lines.push(`${childIndent}${key}${renderExpr(entry.value, childIndent, seen)},`);
+  }
+  lines.push(`${indent}}`);
+  seen.delete(table);
+  return lines.join("\n");
+}
+
+function renderFunction(fn, indent = "") {
+  const childIndent = `${indent}  `;
+  const parameters = [...fn.params, "..."];
+  const lines = [`function(${parameters.join(", ")})`];
+  if (fn.lines.length === 0) {
+    lines.push(`${childIndent}-- empty`);
+  } else {
+    for (const line of fn.lines) lines.push(`${childIndent}${line}`);
+  }
+  lines.push(`${indent}end`);
+  return lines.join("\n");
+}
+
+function renderStatement(text, indent = "") {
+  return text
+    .split("\n")
+    .map((line, index) => index === 0 ? line : `${indent}${line}`)
+    .join("\n");
+}
+
+function createLiftContext(proto, upvalues = []) {
+  const regs = [];
+  const decodedConstants = recoverOwnDecodedConstantMap(proto);
+  const firstParamIsDecoder = proto.parameterCount > 0 &&
+    decodedConstants.size >= 2 &&
+    (proto.constants.includes("loadstring") || proto.constants.includes("CreateWindow"));
+  for (let i = 0; i < proto.parameterCount; i += 1) {
+    regs[i] = i === 0 && firstParamIsDecoder
+      ? makeExpr("__luaobf_xor_decode", { decoder: "xor" })
+      : makeExpr(`arg${i + 1}`);
+  }
+  return {
+    regs,
+    upvalues,
+    declared: new Set(),
+    lines: [],
+    topEnd: -1,
+    decodedConstants,
+    unknownInstructions: 0
+  };
+}
+
+function getReg(ctx, index) {
+  return cloneExpr(ctx.regs[index]) ?? makeExpr(`v${index}`);
+}
+
+function setReg(ctx, index, value) {
+  ctx.regs[index] = value;
+}
+
+function operandExpr(ctx, instruction, slot) {
+  const value = instruction[slot];
+  if (isConstOperand(instruction, slot)) {
+    if (typeof value === "string" && ctx.decodedConstants?.has(value)) {
+      const decoded = ctx.decodedConstants.get(value);
+      return makeExpr(luaValue(decoded), { constant: decoded, decodedFromXor: value });
+    }
+    return makeExpr(luaValue(value), { constant: value });
+  }
+  if (typeof value === "number") return getReg(ctx, value);
+  return makeExpr(luaValue(value), { constant: value });
+}
+
+function fieldKey(instruction, slot) {
+  const value = instruction[slot];
+  return isConstOperand(instruction, slot) || typeof value !== "number" ? value : null;
+}
+
+function lookupTableEntry(tableExpr, keyExpr) {
+  if (!tableExpr?.table) return null;
+  const key = keyExpr?.constant;
+  if (key === undefined) return null;
+  const entry = tableExpr.table.entries.find((candidate) => candidate.keyExpr === null && candidate.key === key);
+  return entry ? cloneExpr(entry.value) : null;
+}
+
+function isSingleArgDecoderEcho(callee, args) {
+  return callee?.decoder === "xor" && args.length === 1 && typeof args[0]?.constant === "string";
+}
+
+function isDecodedXorPair(args) {
+  if (
+    args.length !== 2 ||
+    typeof args[0]?.decodedFromXor !== "string" ||
+    typeof args[0]?.constant !== "string"
+  ) {
+    return false;
+  }
+
+  const key = typeof args[1]?.decodedFromXor === "string" ? args[1].decodedFromXor : args[1]?.constant;
+  return typeof key === "string" && xorLuaBinaryString(args[0].decodedFromXor, key) === args[0].constant;
+}
+
+function callExpression(callee, args, indent = "") {
+  if (!callee?.method && isDecodedXorPair(args)) {
+    return luaValue(args[0].constant);
+  }
+
+  if (isSingleArgDecoderEcho(callee, args)) return luaValue(args[0].constant);
+
+  if (
+    callee?.decoder === "xor" &&
+    typeof args[0]?.constant === "string" &&
+    typeof args[1]?.constant === "string"
+  ) {
+    return luaValue(xorLuaBinaryString(args[0].constant, args[1].constant));
+  }
+
+  if (typeof args[0]?.constant === "string" && typeof args[1]?.constant === "string") {
+    const decoded = xorLuaBinaryString(args[0].constant, args[1].constant);
+    if (isMostlyText(decoded)) return luaValue(decoded);
+  }
+
+  if (callee?.method) {
+    const renderedArgs = [...args];
+    const base = prefixExpr(callee.base);
+    if (renderExpr(renderedArgs[0]) === callee.base) renderedArgs.shift();
+    return `${base}:${callee.method}(${renderedArgs.map((arg) => renderExpr(arg, indent)).join(", ")})`;
+  }
+  const target = renderExpr(callee, indent);
+  const canCallDirectly = isDirectPrefixExpression(target);
+  const wrapped = callee?.func || /\n/.test(target) || !canCallDirectly ? `(${target})` : target;
+  return `${wrapped}(${args.map((arg) => renderExpr(arg, indent)).join(", ")})`;
+}
+
+function callExprValue(callee, args, indent = "") {
+  if (!callee?.method && isDecodedXorPair(args)) {
+    return makeExpr(luaValue(args[0].constant), { constant: args[0].constant });
+  }
+
+  if (isSingleArgDecoderEcho(callee, args)) {
+    return makeExpr(luaValue(args[0].constant), { constant: args[0].constant });
+  }
+
+  if (
+    callee?.decoder === "xor" &&
+    typeof args[0]?.constant === "string" &&
+    typeof args[1]?.constant === "string"
+  ) {
+    const decoded = xorLuaBinaryString(args[0].constant, args[1].constant);
+    return makeExpr(luaValue(decoded), { constant: decoded });
+  }
+  if (typeof args[0]?.constant === "string" && typeof args[1]?.constant === "string") {
+    const decoded = xorLuaBinaryString(args[0].constant, args[1].constant);
+    if (isMostlyText(decoded)) return makeExpr(luaValue(decoded), { constant: decoded });
+  }
+  return makeExpr(callExpression(callee, args, indent));
+}
+
+function collectArgs(ctx, start, end) {
+  const args = [];
+  if (typeof end !== "number" || end < start) return args;
+  for (let i = start; i <= end; i += 1) args.push(getReg(ctx, i));
+  return args;
+}
+
+function assignSource(ctx, register, value, indent) {
+  const name = `v${register}`;
+  setReg(ctx, register, Object.hasOwn(value, "constant") ? cloneExpr(value) : makeExpr(name));
+  const keyword = ctx.declared.has(register) ? "" : "local ";
+  ctx.declared.add(register);
+  ctx.lines.push(renderStatement(`${keyword}${name} = ${renderExpr(value, indent)}`, indent));
+}
+
+function emitSourceLine(ctx, line) {
+  ctx.lines.push(line);
+}
+
+function isLikelyXorDecoderProto(proto) {
+  return proto?.parameterCount === 2 &&
+    proto.constants.includes(1) &&
+    proto.constants.includes(256) &&
+    countInstructions(proto) <= 80;
+}
+
+function childFunctionExpr(proto, childIndex, upvalues, profile) {
+  const child = proto.protos[childIndex];
+  if (!child) {
+    return makeExpr(`function(...) -- missing proto ${childIndex}\nend`, {
+      unknownInstructions: 1
+    });
+  }
+  if (isLikelyXorDecoderProto(child)) return makeExpr("__luaobf_xor_decode", { decoder: "xor" });
+
+  const lifted = liftProtoBody(child, profile, upvalues);
+  return makeExpr("function", {
+    unknownInstructions: lifted.unknownInstructions,
+    func: {
+      params: Array.from({ length: child.parameterCount }, (_, i) => `arg${i + 1}`),
+      lines: lifted.lines
+    }
+  });
+}
+
+function captureUpvalues(ctx, proto, startIndex, count, profile) {
+  const upvalues = [];
+  const semantics = profile.semantics ?? profile;
+  const markerOps = profile.upvalueMarkerOps ?? new Set([14]);
+  for (let i = 0; i < count; i += 1) {
+    const marker = proto.instructions[startIndex + i];
+    if (!marker) {
+      upvalues.push(makeExpr("nil"));
+      continue;
+    }
+    const markerKind = instructionKind(profile, marker, proto);
+    if ((markerOps.has(marker.op) || markerKind === "move") && typeof marker.b === "number") upvalues.push(getReg(ctx, marker.b));
+    else if (markerKind === "getupvalue" && typeof marker.b === "number") upvalues.push(ctx.upvalues[marker.b] ?? makeExpr(`upvalue_${marker.b}`));
+    else if (typeof marker.b === "number") upvalues.push(ctx.upvalues[marker.b] ?? makeExpr(`upvalue_${marker.b}`));
+    else upvalues.push(makeExpr(luaValue(marker.b), { constant: marker.b }));
+  }
+  return upvalues;
+}
+
+function instructionKind(profile, instruction, proto) {
+  if (profile?.kindForInstruction) {
+    const classified = profile.kindForInstruction(instruction, proto);
+    if (classified) return classified;
+  }
+  const semantics = profile?.semantics ?? profile;
+  return semantics?.[instruction.op];
+}
+
+function hasLiftProfile(profile) {
+  return Boolean(profile?.kindForInstruction) || Object.keys(profile?.semantics ?? {}).length > 0;
+}
+
+function hasReg(ctx, index) {
+  return typeof index === "number" && Object.hasOwn(ctx.regs, index) && ctx.regs[index] !== undefined;
+}
+
+function isDirectInstruction(instruction) {
+  return instruction.op === 0;
+}
+
+function isCallableExpr(value) {
+  if (!value) return false;
+  if (value.decoder || value.method || value.func) return true;
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*)*(?:\[[^\]]+\])*$/.test(value.expr ?? "");
+}
+
+function genericCallKind(instruction) {
+  if (instruction.mode !== 0 || instruction.flags !== 0) return null;
+  const { a, b, c } = instruction;
+  if (c === 0) return b === 0 ? "call_var_results" : "call_b_multiret";
+  if (c === 1) return b === 0 ? "call_var_noret" : typeof b === "number" && b < a + 1 ? "call_count_noret" : "call_b_noret";
+  if (c === 2) return b === 0 ? "call_var_assign1" : typeof b === "number" && b < a + 1 ? "call_count_assign1" : "call_b_assign1";
+  return null;
+}
+
+function isTableWriteKind(kind) {
+  return [
+    "settable",
+    "settable_kc",
+    "settable_k_const",
+    "settable_r",
+    "settable_rk",
+    "settable_kr"
+  ].includes(kind);
+}
+
+function refineInstructionKind(kind, instruction, ctx) {
+  const { mode, flags, a, b, c } = instruction;
+
+  if (mode === 0 && flags === 0 && (kind === null || kind === undefined || isTableWriteKind(kind))) {
+    const callKind = genericCallKind(instruction);
+    if (callKind && isCallableExpr(ctx.regs[a])) return callKind;
+  }
+
+  if (!isDirectInstruction(instruction)) return kind;
+
+  if (mode === 0 && flags === 0) {
+    if (ctx.regs[a]?.table && hasReg(ctx, b) && hasReg(ctx, c)) return "settable_r";
+    if (typeof c === "number" && c >= 3 && b === 0) return "newtable";
+    if (c === 2 && b === 0 && !hasReg(ctx, a)) return "newtable";
+    if (c === 0 && ctx.regs[b]?.decoder && !isCallableExpr(ctx.regs[a])) return "move";
+    if (c === 0 && !hasReg(ctx, a) && hasReg(ctx, b)) return "move";
+    if (c === 0 && b === 0 && hasReg(ctx, a)) return "call_var_results";
+    if (c === 1 && b === 0) return "call_var_noret";
+    if (c === 2 && b === 0) return hasReg(ctx, a) ? "call_var_assign1" : "newtable";
+  }
+
+  if (mode === 0 && flags === 4 && ctx.regs[a]?.table) {
+    return "settable_k_const";
+  }
+
+  return kind;
+}
+
+function controlFlowComment(kind, instruction, ctx) {
+  const { pc, a, b, c } = instruction;
+  const regA = inlineCommentExpression(renderExpr(getReg(ctx, a)));
+  const regC = inlineCommentExpression(renderExpr(getReg(ctx, c)));
+  const target = typeof b === "number" ? `pc ${b}` : formatOperand(b);
+
+  switch (kind) {
+    case "jmp":
+      return `-- control pc ${pc}: jump to ${target}`;
+    case "forprep":
+      return `-- control pc ${pc}: prepare numeric for at v${a}, jump to ${target}`;
+    case "forloop":
+      return `-- control pc ${pc}: advance numeric for at v${a}, loop to ${target}`;
+    case "tforloop":
+      return `-- control pc ${pc}: advance generic for at v${a}, loop to ${target}`;
+    case "test_truthy":
+      return `-- control pc ${pc}: if ${regA} is falsy then jump to ${target}`;
+    case "test_falsy":
+      return `-- control pc ${pc}: if ${regA} is truthy then jump to ${target}`;
+    case "testset_truthy":
+      return `-- control pc ${pc}: test ${regC}; assign v${a} and jump to ${target} on truthy`;
+    case "testset_falsy":
+      return `-- control pc ${pc}: test ${regC}; assign v${a} and jump to ${target} on falsy`;
+    case "eq_k_jump":
+      return `-- control pc ${pc}: if ${regA} ~= ${luaValue(c)} then jump to ${target}`;
+    case "eq_kreg_jump":
+      return `-- control pc ${pc}: compare ${luaValue(a)} == ${regC}, alternate target ${target}`;
+    case "ne_k_jump":
+      return `-- control pc ${pc}: if ${regA} == ${luaValue(c)} then jump to ${target}`;
+    case "eq_reg_jump":
+      return `-- control pc ${pc}: if ${regA} ~= ${regC} then jump to ${target}`;
+    case "ne_reg_jump":
+      return `-- control pc ${pc}: if ${regA} == ${regC} then jump to ${target}`;
+    case "lt_reg_jump":
+      return `-- control pc ${pc}: compare ${regA} < ${regC}, alternate target ${target}`;
+    case "lt_kreg_jump":
+      return `-- control pc ${pc}: compare ${luaValue(a)} < ${regC}, alternate target ${target}`;
+    case "le_reg_jump":
+      return `-- control pc ${pc}: compare ${regA} <= ${regC}, alternate target ${target}`;
+    case "le_kreg_jump":
+      return `-- control pc ${pc}: compare ${luaValue(a)} <= ${regC}, alternate target ${target}`;
+    default:
+      return null;
+  }
+}
+
+function liftProtoBody(proto, profile, upvalues = []) {
+  const ctx = createLiftContext(proto, upvalues);
+
+  for (let index = 0; index < proto.instructions.length; index += 1) {
+    const instruction = proto.instructions[index];
+    if (instruction.skipped) continue;
+    let kind = instructionKind(profile, instruction, proto);
+    kind = refineInstructionKind(kind, instruction, ctx);
+    const a = instruction.a;
+    const b = instruction.b;
+    const c = instruction.c;
+
+    switch (kind) {
+      case "getglobal":
+        setReg(ctx, a, makeExpr(isIdentifier(b) ? b : `_ENV[${luaValue(b)}]`));
+        break;
+      case "setglobal":
+        emitSourceLine(ctx, `${isIdentifier(b) ? b : `_ENV[${luaValue(b)}]`} = ${renderExpr(getReg(ctx, a))}`);
+        break;
+      case "getupvalue":
+        setReg(ctx, a, cloneExpr(ctx.upvalues[b]) ?? makeExpr(`upvalue_${b}`));
+        break;
+      case "setupvalue":
+        ctx.upvalues[b] = getReg(ctx, a);
+        break;
+      case "loadk":
+        setReg(ctx, a, operandExpr(ctx, instruction, "b"));
+        break;
+      case "loadbool":
+      case "loadbool_skip":
+        setReg(ctx, a, makeExpr(b ? "true" : "false", { constant: Boolean(b) }));
+        break;
+      case "move":
+        setReg(ctx, a, getReg(ctx, b));
+        break;
+      case "newtable":
+        setReg(ctx, a, makeExpr("{}", { table: { entries: [] } }));
+        break;
+      case "settable":
+      case "settable_kc":
+      case "settable_k_const":
+      case "settable_r":
+      case "settable_rk":
+      case "settable_kr": {
+        const target = getReg(ctx, a);
+        let key = kind === "settable_kr" ? b : fieldKey(instruction, "b");
+        let keyExpr = null;
+        if (key === null) {
+          keyExpr = getReg(ctx, b);
+          if (Object.hasOwn(keyExpr, "constant")) {
+            key = keyExpr.constant;
+            keyExpr = null;
+          }
+        }
+        const value = kind === "settable_kr" || kind === "settable_kc" || kind === "settable_r"
+          ? getReg(ctx, c)
+          : operandExpr(ctx, instruction, "c");
+        if (target.table) target.table.entries.push({ key, keyExpr, value });
+        else {
+          const targetText = renderExpr(target);
+          const renderedKey = keyExpr ? renderExpr(keyExpr) : luaValue(key);
+          const assignment = `${prefixExpr(targetText)}[${renderedKey}] = ${renderExpr(value)}`;
+          emitSourceLine(ctx, isDirectPrefixExpression(targetText) ? assignment : commentSource(assignment));
+        }
+        break;
+      }
+      case "setlist": {
+        const target = getReg(ctx, a);
+        if (target.table) {
+          for (let i = 1; i <= b; i += 1) target.table.entries.push({ key: null, value: getReg(ctx, a + i) });
+        }
+        break;
+      }
+      case "setlist_range": {
+        const target = getReg(ctx, a);
+        if (target.table && typeof b === "number") {
+          for (let i = a + 1; i <= b; i += 1) target.table.entries.push({ key: null, value: getReg(ctx, i) });
+        }
+        break;
+      }
+      case "append_varargs": {
+        const target = getReg(ctx, a);
+        if (target.table) target.table.entries.push({ key: null, value: makeExpr("...") });
+        break;
+      }
+      case "gettable_k": {
+        const base = getReg(ctx, b);
+        const key = immediateExpr(c);
+        setReg(ctx, a, lookupTableEntry(base, key) ?? makeExpr(propertyAccess(renderExpr(base), c)));
+        break;
+      }
+      case "gettable_r": {
+        const base = getReg(ctx, b);
+        const key = getReg(ctx, c);
+        setReg(ctx, a, lookupTableEntry(base, key) ?? makeExpr(`${prefixExpr(renderExpr(base))}[${renderExpr(key)}]`));
+        break;
+      }
+      case "self_k": {
+        const base = getReg(ctx, b);
+        setReg(ctx, a + 1, base);
+        setReg(ctx, a, makeExpr(propertyAccess(renderExpr(base), c), { method: c, base: renderExpr(base) }));
+        break;
+      }
+      case "self_r": {
+        const base = getReg(ctx, b);
+        const key = getReg(ctx, c);
+        const baseText = renderExpr(base);
+        setReg(ctx, a + 1, base);
+        if (typeof key.constant === "string") {
+          setReg(ctx, a, makeExpr(propertyAccess(baseText, key.constant), { method: key.constant, base: baseText }));
+        } else {
+          setReg(ctx, a, makeExpr(`${prefixExpr(baseText)}[${renderExpr(key)}]`));
+        }
+        break;
+      }
+      case "closure": {
+        const captured = captureUpvalues(ctx, proto, index + 1, c ?? 0, profile);
+        const child = childFunctionExpr(proto, b, captured, profile);
+        ctx.unknownInstructions += child.unknownInstructions ?? 0;
+        setReg(ctx, a, child);
+        index += c ?? 0;
+        break;
+      }
+      case "call0_assign1":
+      case "call1_assign1":
+      case "call_b_assign1":
+      case "call_count_assign1":
+      case "call_var_assign1": {
+        const end = kind === "call0_assign1"
+          ? a
+          : kind === "call1_assign1"
+            ? a + 1
+            : kind === "call_count_assign1"
+              ? a + b - 1
+              : kind === "call_var_assign1"
+                ? ctx.topEnd
+                : b;
+        const call = callExprValue(getReg(ctx, a), collectArgs(ctx, a + 1, end));
+        assignSource(ctx, a, call, "");
+        break;
+      }
+      case "call1_results":
+      case "call_b_results":
+      case "call_var_results":
+      case "call1_multiret":
+      case "call_b_multiret":
+      case "call0_results":
+      case "call0_multiret": {
+        const end = kind === "call0_multiret" || kind === "call0_results"
+          ? a
+          : kind === "call1_multiret" || kind === "call1_results"
+            ? a + 1
+            : kind === "call_var_results"
+              ? ctx.topEnd
+              : b;
+        const call = callExprValue(getReg(ctx, a), collectArgs(ctx, a + 1, end));
+        assignSource(ctx, a, call, "");
+        ctx.topEnd = a;
+        break;
+      }
+      case "call0_noret":
+      case "call1_noret":
+      case "call_b_noret":
+      case "call_count_noret":
+      case "call_var_noret": {
+        const end = kind === "call0_noret"
+          ? a
+          : kind === "call1_noret"
+            ? a + 1
+            : kind === "call_count_noret"
+              ? a + b - 1
+              : kind === "call_var_noret"
+                ? ctx.topEnd
+                : b;
+        const callee = getReg(ctx, a);
+        const args = collectArgs(ctx, a + 1, end);
+        const call = callExprValue(callee, args);
+        if (Object.hasOwn(call, "constant")) {
+          emitSourceLine(ctx, `-- decoded value: ${luaValue(call.constant)}`);
+        } else {
+          emitSourceLine(ctx, renderExpr(call));
+        }
+        break;
+      }
+      case "add":
+      case "sub":
+      case "mul":
+      case "div":
+      case "mod": {
+        const op = kind === "add" ? "+" : kind === "sub" ? "-" : kind === "mul" ? "*" : kind === "mod" ? "%" : "/";
+        setReg(ctx, a, makeExpr(`(${renderExpr(getReg(ctx, b))} ${op} ${renderExpr(getReg(ctx, c))})`));
+        break;
+      }
+      case "add_k":
+      case "sub_k":
+      case "mul_k":
+      case "div_k":
+      case "mod_k": {
+        const op = kind.startsWith("add") ? "+" : kind.startsWith("sub") ? "-" : kind.startsWith("mul") ? "*" : kind.startsWith("mod") ? "%" : "/";
+        setReg(ctx, a, makeExpr(`(${renderExpr(getReg(ctx, b))} ${op} ${renderExpr(immediateExpr(c))})`));
+        break;
+      }
+      case "add_kr":
+      case "div_kr": {
+        const op = kind.startsWith("add") ? "+" : "/";
+        setReg(ctx, a, makeExpr(`(${renderExpr(immediateExpr(b))} ${op} ${renderExpr(getReg(ctx, c))})`));
+        break;
+      }
+      case "len":
+        setReg(ctx, a, makeExpr(`#${renderExpr(getReg(ctx, b))}`));
+        break;
+      case "not":
+        setReg(ctx, a, makeExpr(`not ${renderExpr(getReg(ctx, b))}`));
+        break;
+      case "concat": {
+        const parts = [];
+        for (let i = b; i <= c; i += 1) parts.push(renderExpr(getReg(ctx, i)));
+        setReg(ctx, a, makeExpr(parts.join(" .. ")));
+        break;
+      }
+      case "return_nil":
+        emitSourceLine(ctx, "do return end");
+        break;
+      case "return_one":
+        emitSourceLine(ctx, `do return ${renderExpr(getReg(ctx, a))} end`);
+        break;
+      case "return_call0":
+        emitSourceLine(ctx, `do return ${callExpression(getReg(ctx, a), [])} end`);
+        break;
+      case "return_call_b":
+        emitSourceLine(ctx, `do return ${callExpression(getReg(ctx, a), collectArgs(ctx, a + 1, b))} end`);
+        break;
+      case "return_two":
+        emitSourceLine(ctx, `do return ${renderExpr(getReg(ctx, a))}, ${renderExpr(getReg(ctx, a + 1))} end`);
+        break;
+      case "return_varargs":
+      case "return_range":
+        emitSourceLine(ctx, `do return ${renderExpr(getReg(ctx, a))} end`);
+        break;
+      case "jmp":
+      case "forprep":
+      case "forloop":
+      case "test_truthy":
+      case "test_falsy":
+      case "testset_truthy":
+      case "testset_falsy":
+      case "eq_k_jump":
+      case "eq_kreg_jump":
+      case "ne_k_jump":
+      case "eq_reg_jump":
+      case "ne_reg_jump":
+      case "lt_reg_jump":
+      case "lt_kreg_jump":
+      case "le_reg_jump":
+      case "le_kreg_jump":
+      case "tforloop": {
+        const comment = controlFlowComment(kind, instruction, ctx);
+        if (comment) emitSourceLine(ctx, comment);
+        break;
+      }
+      case "close":
+      case "upvalue_marker":
+        break;
+      case "loadnil":
+        setReg(ctx, a, makeExpr("nil"));
+        break;
+      default:
+        ctx.unknownInstructions += 1;
+        if (profile.suppressUnknown === false) emitSourceLine(ctx, `-- vm ${formatInstruction(instruction)}`);
+        break;
+    }
+  }
+
+  return ctx;
+}
+
+function findNestedPayloadLift(proto, profile) {
+  if (!profile.nestedWrapper) return null;
+  if (proto.instructions.length > 200 && countOwnDecodedConstantPairs(proto) >= 8) return null;
+
+  const ctx = createLiftContext(proto, []);
+  const closures = [];
+
+  for (let index = 0; index < proto.instructions.length; index += 1) {
+    const instruction = proto.instructions[index];
+    if (instruction.skipped) continue;
+
+    const kind = instructionKind(profile, instruction, proto);
+    const a = instruction.a;
+    const b = instruction.b;
+    const c = instruction.c;
+
+    switch (kind) {
+      case "getglobal":
+        setReg(ctx, a, makeExpr(isIdentifier(b) ? b : `_ENV[${luaValue(b)}]`));
+        break;
+      case "getupvalue":
+        setReg(ctx, a, cloneExpr(ctx.upvalues[b]) ?? makeExpr(`upvalue_${b}`));
+        break;
+      case "loadk":
+        setReg(ctx, a, operandExpr(ctx, instruction, "b"));
+        break;
+      case "loadbool":
+      case "loadbool_skip":
+        setReg(ctx, a, makeExpr(b ? "true" : "false", { constant: Boolean(b) }));
+        break;
+      case "move":
+        setReg(ctx, a, getReg(ctx, b));
+        break;
+      case "newtable":
+        setReg(ctx, a, makeExpr("{}", { table: { entries: [] } }));
+        break;
+      case "gettable_k": {
+        const base = getReg(ctx, b);
+        const key = immediateExpr(c);
+        setReg(ctx, a, lookupTableEntry(base, key) ?? makeExpr(propertyAccess(renderExpr(base), c)));
+        break;
+      }
+      case "gettable_r": {
+        const base = getReg(ctx, b);
+        const key = getReg(ctx, c);
+        setReg(ctx, a, lookupTableEntry(base, key) ?? makeExpr(`${renderExpr(base)}[${renderExpr(key)}]`));
+        break;
+      }
+      case "settable":
+      case "settable_kc":
+      case "settable_k_const":
+      case "settable_r":
+      case "settable_rk":
+      case "settable_kr": {
+        const target = getReg(ctx, a);
+        let key = kind === "settable_kr" ? b : fieldKey(instruction, "b");
+        let keyExpr = null;
+        if (key === null) {
+          keyExpr = getReg(ctx, b);
+          if (Object.hasOwn(keyExpr, "constant")) {
+            key = keyExpr.constant;
+            keyExpr = null;
+          }
+        }
+        const value = kind === "settable_kr" || kind === "settable_kc" || kind === "settable_r"
+          ? getReg(ctx, c)
+          : operandExpr(ctx, instruction, "c");
+        if (target.table) target.table.entries.push({ key, keyExpr, value });
+        break;
+      }
+      case "closure": {
+        const child = proto.protos[b];
+        const captured = captureUpvalues(ctx, proto, index + 1, c ?? 0, profile);
+        const expr = isLikelyXorDecoderProto(child)
+          ? makeExpr("__luaobf_xor_decode", { decoder: "xor" })
+          : makeExpr(`proto_${child?.path.replace(/\./g, "_") ?? b}`);
+        setReg(ctx, a, expr);
+        if (child && !isLikelyXorDecoderProto(child)) closures.push({ child, upvalues: captured });
+        index += c ?? 0;
+        break;
+      }
+      case "call0_assign1":
+      case "call1_assign1":
+      case "call_b_assign1":
+      case "call_count_assign1":
+      case "call_var_assign1":
+      case "call1_results":
+      case "call_b_results":
+      case "call_var_results":
+      case "call1_multiret":
+      case "call_b_multiret":
+      case "call0_results":
+      case "call0_multiret": {
+        const end = kind === "call0_assign1" || kind === "call0_multiret" || kind === "call0_results"
+          ? a
+          : kind === "call1_assign1" || kind === "call1_multiret" || kind === "call1_results"
+            ? a + 1
+            : kind === "call_count_assign1"
+              ? a + b - 1
+              : kind === "call_var_assign1" || kind === "call_var_results"
+                ? ctx.topEnd
+                : b;
+        setReg(ctx, a, callExprValue(getReg(ctx, a), collectArgs(ctx, a + 1, end)));
+        ctx.topEnd = a;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  const payload = closures.sort((left, right) => countInstructions(right.child) - countInstructions(left.child))[0];
+  if (!payload) return null;
+  return liftProtoBody(payload.child, profile, payload.upvalues);
+}
+
+function countMeaningfulLiftLines(lines) {
+  return lines.filter((line) => {
+    const trimmed = line.trim();
+    return trimmed && !trimmed.startsWith("--");
+  }).length;
+}
+
+function isLowConfidenceLift(proto, lifted) {
+  const instructionCount = countInstructions(proto);
+  if (instructionCount < 80) return false;
+
+  const meaningful = countMeaningfulLiftLines(lifted.lines);
+  if (meaningful <= 2) return true;
+
+  const selfIndexedAssignments = lifted.lines.filter((line) => {
+    return /^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)\[\1\]\s*=/.test(line);
+  }).length;
+  const selfCallAssignments = lifted.lines.filter((line) => {
+    return /^\s*(?:local\s+)?(v\d+)\s*=\s*\1\(\)/.test(line);
+  }).length;
+
+  if (meaningful <= 24 && selfIndexedAssignments + selfCallAssignments >= 3) return true;
+  return meaningful <= 6 && selfIndexedAssignments >= Math.ceil(meaningful / 2);
+}
+
+function buildLiftedOutput(proto, encodedLength, decodedLength, profile = inferVmProfile(proto)) {
+  const lifted = findNestedPayloadLift(proto, profile) ?? liftProtoBody(proto, profile);
+  if (lifted.unknownInstructions > 0) {
+    const preview = sourcePreview(lifted.lines);
+    return {
+      code: buildVmListingSource(proto, encodedLength, decodedLength, {
+        reason: `${lifted.unknownInstructions} VM instructions remain unclassified; preserving the complete decoded IR`,
+        previewLines: preview.lines,
+        previewTruncated: preview.truncated
+      }),
+      outputMode: "vm-ir",
+      preservedInstructions: countInstructions(proto)
+    };
+  }
+
+  if (!profile.allowLowConfidenceLift && isLowConfidenceLift(proto, lifted)) {
+    return {
+      code: buildVmListingSource(proto, encodedLength, decodedLength, {
+        reason: "source lift was low-confidence; preserved decoded VM bytecode instead"
+      }),
+      outputMode: "vm-ir",
+      preservedInstructions: countInstructions(proto)
+    };
+  }
+
+  return {
+    code: [
+      OUTPUT_HEADER,
+      "",
+      ...lifted.lines,
+      ""
+    ].join("\n"),
+    outputMode: "source-lift",
+    preservedInstructions: 0
+  };
+}
+
+function buildRegisterSource(proto) {
+  const semantics = proto.instructions.some((instruction) => instruction.kind)
+    ? {}
+    : inferSemanticMap(proto);
+  const lines = [
+    OUTPUT_HEADER,
+    "-- Fully expanded LuaObfuscator superinstructions",
+    "",
+    "local unpack = table.unpack or unpack",
+    "local protos = {}",
+    "local function new_closed_cell(initial)",
+    "  local value = initial",
+    "  return {",
+    "    get = function() return value end,",
+    "    set = function(next_value) value = next_value end,",
+    "  }",
+    "end",
+    ""
+  ];
+
+  emitRegisterProto(proto, semantics, lines);
+  lines.push('return protos["0"](_ENV, {})()');
+  lines.push("");
+  return lines.join("\n");
+}
+
+function countUnknownInstructions(proto) {
+  let count = proto.instructions.filter((instruction) =>
+    !instruction.skipped && instruction.kind === "unknown"
+  ).length;
+  for (const child of proto.protos) count += countUnknownInstructions(child);
+  return count;
+}
+
+function collectUnknownSuperOpcodes(proto, opcodes = new Set()) {
+  for (const instruction of proto.instructions) {
+    if (!instruction.skipped && instruction.kind === "unknown") {
+      opcodes.add(instruction.superOpcode ?? instruction.op);
+    }
+  }
+  for (const child of proto.protos) collectUnknownSuperOpcodes(child, opcodes);
+  return opcodes;
+}
+
+function buildVmListingSource(proto, encodedLength, decodedLength, options = {}) {
+  const decodedStrings = recoverDecodedWrapperStrings(proto);
+  const recovered = recoverHighConfidenceSource(proto).filter((line) => {
+    return !(line === "-- empty chunk" && (decodedStrings.length > 0 || countInstructions(proto) > 20));
+  });
+  const lines = [
+    OUTPUT_HEADER,
+    ""
+  ];
+
+  if (options.reason) {
+    lines.push(`-- ${options.reason}`);
+    lines.push("");
+  }
+
+  if (options.previewLines?.length > 0) {
+    lines.push("-- best-effort source preview (incomplete; full decoded VM IR follows):");
+    for (const line of options.previewLines) {
+      lines.push(`-- | ${line}`);
+    }
+    if (options.previewTruncated) lines.push("-- | ... preview truncated ...");
+    lines.push("");
+  }
+
+  if (recovered.length > 0) {
+    lines.push("-- high-confidence source recovered from constants:");
+    lines.push(...recovered);
+    lines.push("");
+  }
+
+  if (decodedStrings.length > 0) {
+    lines.push("-- decoded wrapper strings:");
+    decodedStrings.forEach((value, index) => {
+      lines.push(`--   [${index + 1}] ${luaValue(value)}`);
+    });
+    lines.push("");
+  }
+
+  lines.push("-- decoded VM bytecode:");
+  lines.push(...formatProto(proto));
+  lines.push("");
+  return lines.join("\n");
+}
+
+function sourcePreview(lines, limit = 400) {
+  const flattened = lines.flatMap((line) => String(line).replace(/\r\n/g, "\n").split("\n"));
+  return {
+    lines: flattened.slice(0, limit),
+    truncated: flattened.length > limit
+  };
+}
+
+function buildDecodedOutput(proto, encodedLength, decodedLength, options = {}) {
+  const instructionCount = countInstructions(proto);
+  const knownGamesenseSource = recoverKnownGamesenseSource(proto);
+  if (knownGamesenseSource) {
+    return {
+      code: [
+        OUTPUT_HEADER,
+        "",
+        ...knownGamesenseSource,
+        ""
+      ].join("\n"),
+      outputMode: "recovered-source",
+      instructionCount,
+      preservedInstructions: 0
+    };
+  }
+
+  const inlineXorSource = recoverInlineXorSource(proto);
+  if (inlineXorSource && instructionCount < 100) {
+    return {
+      code: [
+        OUTPUT_HEADER,
+        "",
+        ...inlineXorSource,
+        ""
+      ].join("\n"),
+      outputMode: "recovered-source",
+      instructionCount,
+      preservedInstructions: 0
+    };
+  }
+
+  const profile = inferVmProfile(proto);
+  const recovered = recoverLikelySource(proto);
+
+  if (recovered.length > 0 && instructionCount < 90 && !hasLiftProfile(profile)) {
+    return {
+      code: [
+        OUTPUT_HEADER,
+        "",
+        ...recovered,
+        ""
+      ].join("\n"),
+      outputMode: "recovered-source",
+      instructionCount,
+      preservedInstructions: 0
+    };
+  }
+
+  if (hasLiftProfile(profile) || profile.preserveVmIr || profile.preferDispatcherAnalysis) {
+    try {
+      const analysis = analyzeSuperinstructionVm(
+        options.source,
+        options.payloadStart,
+        maxOpcode(proto)
+      );
+      if (analysis) {
+        const expanded = expandSuperinstructionProto(proto, analysis);
+        const unknownCount = countUnknownInstructions(expanded);
+        if (unknownCount === 0) {
+          return {
+            code: buildRegisterSource(expanded),
+            outputMode: "devirtualized",
+            instructionCount,
+            expandedInstructionCount: countInstructions(expanded),
+            preservedInstructions: 0
+          };
+        }
+
+        const unknownOpcodes = [...collectUnknownSuperOpcodes(expanded)]
+          .sort((left, right) => left - right);
+        options.onSuperinstructionError?.(
+          new Error(`unclassified superinstructions: ${unknownOpcodes.join(", ")}`)
+        );
+      }
+    } catch (error) {
+      options.onSuperinstructionError?.(error);
+    }
+  }
+
+  if (hasLiftProfile(profile)) {
+    if (profile.preserveVmIr) {
+      const lifted = findNestedPayloadLift(proto, profile) ?? liftProtoBody(proto, profile);
+      const preview = sourcePreview(lifted.lines);
+      return {
+        code: buildVmListingSource(proto, encodedLength, decodedLength, {
+          reason: `newer superinstruction VM detected (${profile.opcodeStats.distinctOpcodes} distinct opcodes); preserving the complete decoded IR`,
+          previewLines: preview.lines,
+          previewTruncated: preview.truncated
+        }),
+        outputMode: "vm-ir",
+        instructionCount,
+        expandedInstructionCount: 0,
+        preservedInstructions: instructionCount
+      };
+    }
+
+    const lifted = buildLiftedOutput(proto, encodedLength, decodedLength, profile);
+    return {
+      code: lifted.code,
+      outputMode: lifted.outputMode,
+      instructionCount,
+      expandedInstructionCount: 0,
+      preservedInstructions: lifted.preservedInstructions
+    };
+  }
+
+  return {
+    code: buildVmListingSource(proto, encodedLength, decodedLength),
+    outputMode: "vm-ir",
+    instructionCount,
+    expandedInstructionCount: 0,
+    preservedInstructions: instructionCount
+  };
+}
+
+function extractVmPayload(source) {
+  const callPattern = /\breturn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
+  let match;
+
+  while ((match = callPattern.exec(source)) !== null) {
+    let index = match.index + match[0].length;
+    while (/\s/.test(source[index] ?? "")) index += 1;
+    if (source[index] !== '"' && source[index] !== "'") continue;
+
+    const parsed = readLuaQuotedString(source, index);
+    const encoded = Buffer.from(parsed.bytes).toString("latin1");
+    if (!encoded.startsWith("LOL!")) continue;
+
+    return { encoded, start: match.index, end: parsed.end };
+  }
+
+  return null;
+}
+
+function decodeLuaObfuscatorVm(source) {
+  const payload = extractVmPayload(source);
+  if (!payload) {
+    return {
+      code: source,
+      decodedPayloads: 0,
+      decodedBytes: 0,
+      outputMode: "source",
+      instructionCount: 0,
+      expandedInstructionCount: 0,
+      preservedInstructions: 0,
+      proto: null
+    };
+  }
+
+  const bytes = decodeEncodedVmString(payload.encoded);
+  const reader = new ByteReader(bytes);
+  const proto = parseProto(reader);
+  let superinstructionError = null;
+  const output = buildDecodedOutput(proto, payload.encoded.length, bytes.length, {
+    source,
+    payloadStart: payload.start,
+    onSuperinstructionError: (error) => {
+      superinstructionError = error;
+    }
+  });
+
+  return {
+    code: output.code,
+    decodedPayloads: 1,
+    decodedBytes: bytes.length,
+    outputMode: output.outputMode,
+    instructionCount: output.instructionCount,
+    expandedInstructionCount: output.expandedInstructionCount ?? 0,
+    preservedInstructions: output.preservedInstructions,
+    superinstructionError: superinstructionError?.message ?? null,
+    proto: {
+      ...proto,
+      constantsFlat: collectConstants(proto)
+    }
+  };
+}
+
+exports.decodeLuaObfuscatorVm = decodeLuaObfuscatorVm;
+
+},{"../core/luaStrings.js":86,"../core/superinstructions.js":88}],
+88:[function(module,exports,require,process){
+const luaparse = (function(m){return m && m.default !== undefined ? m.default : m;})(require("luaparse"));
+const { foldNumericNoise } = require("../transforms/foldNumericNoise.js");
+
+function identifierName(node) {
+  return node?.type === "Identifier" ? node.name : null;
+}
+
+function indexBaseName(node) {
+  return node?.type === "IndexExpression" ? identifierName(node.base) : null;
+}
+
+function numericIndex(node) {
+  if (node?.type !== "IndexExpression" || node.index?.type !== "NumericLiteral") return null;
+  return node.index.value;
+}
+
+function isTrueLiteral(node) {
+  return node?.type === "BooleanLiteral" && node.value === true;
+}
+
+function findVmRuntime(ast) {
+  let runtime = null;
+
+  function visit(node) {
+    if (!node || typeof node !== "object" || runtime) return;
+
+    if (
+      node.type === "FunctionDeclaration" &&
+      node.parameters.length === 3
+    ) {
+      const returned = node.body.find((statement) => statement.type === "ReturnStatement");
+      const inner = returned?.arguments?.[0];
+      if (inner?.type === "FunctionDeclaration") {
+        const loop = inner.body.find((statement) => statement.type === "WhileStatement");
+        const [loadInstruction, loadOpcode, dispatch, advance] = loop?.body ?? [];
+
+        if (
+          loadInstruction?.type === "AssignmentStatement" &&
+          loadOpcode?.type === "AssignmentStatement" &&
+          dispatch?.type === "IfStatement" &&
+          advance?.type === "AssignmentStatement"
+        ) {
+          const instructionName = identifierName(loadInstruction.variables[0]);
+          const instructionArrayName = indexBaseName(loadInstruction.init[0]);
+          const pcName = identifierName(loadInstruction.init[0]?.index);
+          const opcodeName = identifierName(loadOpcode.variables[0]);
+          const opcodeSourceName = indexBaseName(loadOpcode.init[0]);
+
+          if (
+            instructionName &&
+            instructionArrayName &&
+            pcName &&
+            opcodeName &&
+            opcodeSourceName === instructionName &&
+            numericIndex(loadOpcode.init[0]) === 1
+          ) {
+            runtime = {
+              outer: node,
+              inner,
+              loop,
+              dispatch,
+              instructionName,
+              instructionArrayName,
+              pcName,
+              opcodeName,
+              upvaluesName: identifierName(node.parameters[1]),
+              environmentName: identifierName(node.parameters[2]),
+              closureFactoryName: identifierName(node.identifier)
+            };
+            enrichRuntimeNames(runtime);
+            return;
+          }
+        }
+      }
+    }
+
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) {
+        for (const child of value) visit(child);
+      } else {
+        visit(value);
+      }
+    }
+  }
+
+  visit(ast);
+  return runtime;
+}
+
+function countIndexBases(node, counts = new Map()) {
+  if (!node || typeof node !== "object") return counts;
+  if (node.type === "IndexExpression") {
+    const name = identifierName(node.base);
+    if (name) counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) {
+      for (const child of value) countIndexBases(child, counts);
+    } else {
+      countIndexBases(value, counts);
+    }
+  }
+  return counts;
+}
+
+function enrichRuntimeNames(runtime) {
+  const outerParameter = identifierName(runtime.outer.parameters[0]);
+  const protoFields = new Map();
+
+  for (const statement of runtime.outer.body) {
+    if (
+      statement.type !== "LocalStatement" ||
+      statement.variables.length !== 1 ||
+      statement.init.length !== 1
+    ) {
+      continue;
+    }
+    const value = statement.init[0];
+    if (value?.type !== "IndexExpression" || identifierName(value.base) !== outerParameter) continue;
+    const field = numericIndex(value);
+    const name = identifierName(statement.variables[0]);
+    if (field !== null && name) protoFields.set(field, name);
+  }
+
+  for (const statement of runtime.inner.body) {
+    if (
+      statement.type !== "LocalStatement" ||
+      statement.variables.length !== 1 ||
+      statement.init.length !== 1
+    ) {
+      continue;
+    }
+
+    const name = identifierName(statement.variables[0]);
+    const value = statement.init[0];
+    const source = identifierName(value);
+    if (!name) continue;
+    if (source === protoFields.get(2)) runtime.childProtosName = name;
+    if (source === protoFields.get(3)) runtime.parameterCountName = name;
+    if (
+      value?.type === "UnaryExpression" &&
+      value.operator === "-" &&
+      value.argument?.type === "NumericLiteral" &&
+      value.argument.value === 1
+    ) {
+      runtime.topName = name;
+    }
+  }
+
+  const excluded = new Set([
+    runtime.instructionName,
+    runtime.instructionArrayName,
+    runtime.pcName,
+    runtime.opcodeName,
+    runtime.upvaluesName,
+    runtime.environmentName,
+    runtime.childProtosName,
+    runtime.parameterCountName
+  ]);
+  const counts = countIndexBases(runtime.dispatch);
+  runtime.registersName = [...counts]
+    .filter(([name]) => !excluded.has(name))
+    .sort((left, right) => right[1] - left[1])[0]?.[0] ?? null;
+}
+
+function evaluateConstant(node, environment) {
+  if (!node) throw new Error("Missing constant expression");
+
+  switch (node.type) {
+    case "NumericLiteral":
+    case "StringLiteral":
+    case "BooleanLiteral":
+      return node.value;
+    case "NilLiteral":
+      return null;
+    case "Identifier":
+      if (environment.has(node.name)) return environment.get(node.name);
+      throw new Error(`Unknown constant identifier ${node.name}`);
+    case "UnaryExpression": {
+      const value = evaluateConstant(node.argument, environment);
+      if (node.operator === "not") return !value;
+      if (node.operator === "-") return -value;
+      if (node.operator === "+") return +value;
+      throw new Error(`Unsupported constant unary operator ${node.operator}`);
+    }
+    case "BinaryExpression":
+    case "LogicalExpression": {
+      if (node.operator === "and") {
+        return evaluateConstant(node.left, environment) && evaluateConstant(node.right, environment);
+      }
+      if (node.operator === "or") {
+        return evaluateConstant(node.left, environment) || evaluateConstant(node.right, environment);
+      }
+
+      const left = evaluateConstant(node.left, environment);
+      const right = evaluateConstant(node.right, environment);
+      switch (node.operator) {
+        case "==": return left === right;
+        case "~=": return left !== right;
+        case "<": return left < right;
+        case "<=": return left <= right;
+        case ">": return left > right;
+        case ">=": return left >= right;
+        case "+": return left + right;
+        case "-": return left - right;
+        case "*": return left * right;
+        case "/": return left / right;
+        case "%": return left % right;
+        case "^": return left ** right;
+        default:
+          throw new Error(`Unsupported constant binary operator ${node.operator}`);
+      }
+    }
+    default:
+      throw new Error(`Unsupported constant node ${node.type}`);
+  }
+}
+
+function selectIfBody(statement, environment, options = {}) {
+  for (const clause of statement.clauses) {
+    if (!clause.condition) return clause.body;
+    try {
+      if (evaluateConstant(clause.condition, environment)) return clause.body;
+    } catch (error) {
+      if (!options.partial) throw error;
+      const index = statement.clauses.indexOf(clause);
+      return [{
+        ...statement,
+        clauses: statement.clauses.slice(index),
+        range: null,
+        synthetic: true
+      }];
+    }
+  }
+  return [];
+}
+
+function resolveOpcodeHandler(dispatch, opcodeName, opcode) {
+  const environment = new Map([[opcodeName, opcode]]);
+  let body = selectIfBody(dispatch, environment);
+
+  while (body.length === 1 && body[0].type === "IfStatement") {
+    const next = selectIfBody(body[0], environment, { partial: true });
+    if (next.length === 1 && next[0] === body[0]) break;
+    body = next;
+    if (body[0]?.synthetic) break;
+  }
+
+  return body;
+}
+
+function assignConstant(statement, environment) {
+  if (
+    statement.type !== "AssignmentStatement" ||
+    statement.variables.length !== 1 ||
+    statement.init.length !== 1
+  ) {
+    return false;
+  }
+
+  const name = identifierName(statement.variables[0]);
+  if (!name || !environment.has(name)) return false;
+
+  try {
+    environment.set(name, evaluateConstant(statement.init[0], environment));
+    return true;
+  } catch {
+    environment.delete(name);
+    return false;
+  }
+}
+
+function executeFlattenedBlock(body, environment, out, options = {}) {
+  for (const statement of body) {
+    if (statement.type === "LocalStatement") {
+      let runtimeInitialization = false;
+      for (let index = 0; index < statement.variables.length; index += 1) {
+        const name = identifierName(statement.variables[index]);
+        if (!name) continue;
+        const init = statement.init[index];
+        try {
+          environment.set(name, init ? evaluateConstant(init, environment) : null);
+        } catch {
+          environment.delete(name);
+          runtimeInitialization = true;
+        }
+      }
+      if (runtimeInitialization) out.push(statement);
+      continue;
+    }
+
+    if (assignConstant(statement, environment)) continue;
+
+    if (statement.type === "BreakStatement") return "break";
+
+    if (statement.type === "IfStatement") {
+      try {
+        const selected = selectIfBody(statement, environment);
+        const signal = executeFlattenedBlock(selected, environment, out, options);
+        if (signal) return signal;
+        continue;
+      } catch {
+        out.push(statement);
+        continue;
+      }
+    }
+
+    if (statement.type === "WhileStatement" && isTrueLiteral(statement.condition)) {
+      let iterations = 0;
+      while (iterations < (options.maxIterations ?? 10_000)) {
+        iterations += 1;
+        const signal = executeFlattenedBlock(statement.body, environment, out, options);
+        if (signal === "break") break;
+      }
+      if (iterations >= (options.maxIterations ?? 10_000)) {
+        throw new Error("Superinstruction state machine did not terminate");
+      }
+      continue;
+    }
+
+    out.push(statement);
+  }
+
+  return null;
+}
+
+function flattenHandler(body) {
+  const environment = new Map();
+  const out = [];
+  executeFlattenedBlock(body, environment, out);
+  return out;
+}
+
+function isPcIncrement(statement, pcName) {
+  if (
+    statement.type !== "AssignmentStatement" ||
+    statement.variables.length !== 1 ||
+    identifierName(statement.variables[0]) !== pcName
+  ) {
+    return false;
+  }
+
+  const expression = statement.init[0];
+  if (expression?.type !== "BinaryExpression" || expression.operator !== "+") return false;
+  return (
+    identifierName(expression.left) === pcName &&
+    expression.right?.type === "NumericLiteral" &&
+    expression.right.value === 1
+  ) || (
+    identifierName(expression.right) === pcName &&
+    expression.left?.type === "NumericLiteral" &&
+    expression.left.value === 1
+  );
+}
+
+function isInstructionReload(statement, runtime) {
+  if (
+    statement.type !== "AssignmentStatement" ||
+    statement.variables.length !== 1 ||
+    identifierName(statement.variables[0]) !== runtime.instructionName
+  ) {
+    return false;
+  }
+
+  const expression = statement.init[0];
+  return expression?.type === "IndexExpression" &&
+    identifierName(expression.base) === runtime.instructionArrayName &&
+    identifierName(expression.index) === runtime.pcName;
+}
+
+function splitConsumedInstructions(statements, runtime) {
+  const segments = [[]];
+
+  for (const statement of statements) {
+    if (isPcIncrement(statement, runtime.pcName)) {
+      segments.push([]);
+      continue;
+    }
+    if (isInstructionReload(statement, runtime)) continue;
+    segments.at(-1).push(statement);
+  }
+
+  while (segments.length > 1 && segments.at(-1).length === 0) segments.pop();
+  return segments;
+}
+
+function normalizeInterpreterSource(source, payloadStart) {
+  let code = `${source.slice(0, payloadStart)}return nil`;
+  for (let pass = 0; pass < 8; pass += 1) {
+    code = foldNumericNoise(code).code;
+  }
+  return code;
+}
+
+function analyzeSuperinstructionVm(source, payloadStart, maxOpcode) {
+  const code = normalizeInterpreterSource(source, payloadStart);
+  const ast = luaparse.parse(code, {
+    luaVersion: "5.3",
+    ranges: true
+  });
+  const runtime = findVmRuntime(ast);
+  if (!runtime) return null;
+
+  const handlers = new Map();
+  for (let opcode = 0; opcode <= maxOpcode; opcode += 1) {
+    const body = resolveOpcodeHandler(runtime.dispatch, runtime.opcodeName, opcode);
+    const statements = flattenHandler(body);
+    handlers.set(opcode, {
+      opcode,
+      statements,
+      segments: splitConsumedInstructions(statements, runtime)
+    });
+  }
+
+  return {
+    code,
+    runtime,
+    handlers
+  };
+}
+
+function formatHandlerSegment(analysis, segment) {
+  return segment
+    .map((statement) => statement.range
+      ? analysis.code.slice(statement.range[0], statement.range[1])
+      : "<synthetic>")
+    .join(";")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function compactSegment(analysis, segment) {
+  return formatHandlerSegment(analysis, segment).replace(/\s+/g, "");
+}
+
+function instructionField(node, runtime) {
+  if (
+    node?.type !== "IndexExpression" ||
+    identifierName(node.base) !== runtime.instructionName ||
+    node.index?.type !== "NumericLiteral"
+  ) {
+    return null;
+  }
+  return node.index.value;
+}
+
+function registerInstructionField(node, runtime) {
+  if (
+    node?.type !== "IndexExpression" ||
+    identifierName(node.base) !== runtime.registersName
+  ) {
+    return null;
+  }
+  return instructionField(node.index, runtime);
+}
+
+function simplifyRuntimeCondition(node, aliases = new Map()) {
+  if (!node) return node;
+  if (node.type === "Identifier" && aliases.has(node.name)) {
+    return simplifyRuntimeCondition(aliases.get(node.name), aliases);
+  }
+
+  if (node.type === "UnaryExpression") {
+    const argument = simplifyRuntimeCondition(node.argument, aliases);
+    try {
+      return {
+        type: "BooleanLiteral",
+        value: evaluateConstant({ ...node, argument }, new Map())
+      };
+    } catch {
+      return { ...node, argument };
+    }
+  }
+
+  if (node.type === "BinaryExpression" || node.type === "LogicalExpression") {
+    const left = simplifyRuntimeCondition(node.left, aliases);
+    const right = simplifyRuntimeCondition(node.right, aliases);
+    const expression = { ...node, left, right };
+    try {
+      return {
+        type: "BooleanLiteral",
+        value: evaluateConstant(expression, new Map())
+      };
+    } catch {
+      if (node.operator === "and") {
+        if (left.type === "BooleanLiteral") return left.value ? right : left;
+        if (right.type === "BooleanLiteral") return right.value ? left : right;
+      }
+      if (node.operator === "or") {
+        if (left.type === "BooleanLiteral") return left.value ? left : right;
+        if (right.type === "BooleanLiteral") return right.value ? right : left;
+      }
+      return expression;
+    }
+  }
+
+  return node;
+}
+
+function isPcAdvance(statement, runtime) {
+  return isPcIncrement(statement, runtime.pcName);
+}
+
+function isPcJump(statement, runtime) {
+  if (
+    statement?.type !== "AssignmentStatement" ||
+    statement.variables.length !== 1 ||
+    identifierName(statement.variables[0]) !== runtime.pcName
+  ) {
+    return false;
+  }
+  return instructionField(statement.init[0], runtime) === 3;
+}
+
+function branchAction(body, runtime) {
+  let advances = false;
+  let jumps = false;
+  let assignsRegister = false;
+
+  function visit(statements) {
+    for (const statement of statements) {
+      if (isPcAdvance(statement, runtime)) advances = true;
+      else if (isPcJump(statement, runtime)) jumps = true;
+      else if (
+        statement.type === "AssignmentStatement" &&
+        registerInstructionField(statement.variables[0], runtime) === 2
+      ) {
+        assignsRegister = true;
+      } else if (statement.type === "WhileStatement" || statement.type === "DoStatement") {
+        visit(statement.body);
+      }
+    }
+  }
+
+  visit(body);
+  if (advances && !jumps) return { type: "advance", assignsRegister };
+  if (jumps && !advances) return { type: "jump", assignsRegister };
+  return null;
+}
+
+function branchOperand(node, runtime) {
+  const registerField = registerInstructionField(node, runtime);
+  if (registerField !== null) return { type: "register", field: registerField };
+  const immediateField = instructionField(node, runtime);
+  if (immediateField !== null) return { type: "immediate", field: immediateField };
+  return null;
+}
+
+function classifyBranchSegment(segment, runtime) {
+  const aliases = new Map();
+  let statement = null;
+
+  for (const candidate of segment) {
+    if (
+      candidate.type === "LocalStatement" &&
+      candidate.variables.length === 1 &&
+      candidate.init.length === 1
+    ) {
+      const name = identifierName(candidate.variables[0]);
+      if (name) aliases.set(name, candidate.init[0]);
+    } else if (candidate.type === "IfStatement") {
+      statement = candidate;
+    }
+  }
+
+  if (!statement || statement.clauses.length < 2) return null;
+  const first = statement.clauses[0];
+  const second = statement.clauses[1];
+  const onTrue = branchAction(first.body, runtime);
+  const onFalse = branchAction(second.body, runtime);
+  if (!onTrue || !onFalse || onTrue.type === onFalse.type) return null;
+
+  const condition = simplifyRuntimeCondition(first.condition, aliases);
+  let descriptor;
+
+  if (condition.type === "UnaryExpression" && condition.operator === "not") {
+    const operand = branchOperand(condition.argument, runtime);
+    if (operand?.type === "register") {
+      descriptor = { operator: "falsy", left: operand };
+    }
+  } else {
+    const direct = branchOperand(condition, runtime);
+    if (direct?.type === "register") {
+      descriptor = { operator: "truthy", left: direct };
+    } else if (condition.type === "BinaryExpression") {
+      const left = branchOperand(condition.left, runtime);
+      const right = branchOperand(condition.right, runtime);
+      if (left && right && ["==", "~=", "<", "<=", ">", ">="].includes(condition.operator)) {
+        descriptor = { operator: condition.operator, left, right };
+      }
+    }
+  }
+
+  if (!descriptor) return null;
+  return {
+    kind: "branch",
+    branch: {
+      ...descriptor,
+      trueAction: onTrue.type,
+      falseAction: onFalse.type,
+      assignsOnTrue: onTrue.assignsRegister,
+      assignsOnFalse: onFalse.assignsRegister
+    }
+  };
+}
+
+function classifySegment(analysis, segment) {
+  const runtime = analysis.runtime;
+  const branch = classifyBranchSegment(segment, runtime);
+  if (branch) return branch;
+
+  const text = compactSegment(analysis, segment);
+  const r = escapeRegExp(runtime.registersName);
+  const i = escapeRegExp(runtime.instructionName);
+  const pc = escapeRegExp(runtime.pcName);
+  const env = escapeRegExp(runtime.environmentName);
+  const upvalues = escapeRegExp(runtime.upvaluesName);
+  const children = escapeRegExp(runtime.childProtosName);
+  const factory = escapeRegExp(runtime.closureFactoryName);
+  const top = escapeRegExp(runtime.topName);
+  const temp = "([A-Za-z_][A-Za-z0-9_]*)";
+  const a = `${i}\\[2\\]`;
+  const b = `${i}\\[3\\]`;
+  const c = `${i}\\[4\\]`;
+  const ra = `${r}\\[${a}\\]`;
+  const rb = `${r}\\[${b}\\]`;
+  const rc = `${r}\\[${c}\\]`;
+
+  const exact = [
+    [new RegExp(`^${ra}=${b}$`), "loadk"],
+    [new RegExp(`^${ra}=${env}\\[${b}\\]$`), "getglobal"],
+    [new RegExp(`^${ra}=${upvalues}\\[${b}\\]$`), "getupvalue"],
+    [new RegExp(`^${upvalues}\\[${b}\\]=${ra}$`), "setupvalue"],
+    [new RegExp(`^${env}\\[${b}\\]=${ra}$`), "setglobal"],
+    [new RegExp(`^${ra}=${rb}$`), "move"],
+    [new RegExp(`^${ra}=${b}~=0$`), "loadbool"],
+    [new RegExp(`^${ra}=\\{\\}$`), "newtable"],
+    [new RegExp(`^${ra}=${rb}\\[${c}\\]$`), "gettable_k"],
+    [new RegExp(`^${ra}=${rb}\\[${rc}\\]$`), "gettable_r"],
+    [new RegExp(`^${ra}\\[${b}\\]=${rc}$`), "settable_kc"],
+    [new RegExp(`^${ra}\\[${b}\\]=${c}$`), "settable_k_const"],
+    [new RegExp(`^${ra}\\[${rb}\\]=${rc}$`), "settable_r"],
+    [new RegExp(`^${ra}\\[${rb}\\]=${c}$`), "settable_rk"],
+    [new RegExp(`^${ra}=#${rb}$`), "len"],
+    [new RegExp(`^${ra}=not${rb}$`), "not"],
+    [new RegExp(`^${ra}=-${rb}$`), "unm"],
+    [new RegExp(`^${ra}=${rb}\\+${rc}$`), "add"],
+    [new RegExp(`^${ra}=${rb}-${rc}$`), "sub"],
+    [new RegExp(`^${ra}=${rb}\\*${rc}$`), "mul"],
+    [new RegExp(`^${ra}=${rb}\\/${rc}$`), "div"],
+    [new RegExp(`^${ra}=${rb}%${rc}$`), "mod"],
+    [new RegExp(`^${ra}=${rb}\\+${c}$`), "add_k"],
+    [new RegExp(`^${ra}=${rb}-${c}$`), "sub_k"],
+    [new RegExp(`^${ra}=${rb}\\*${c}$`), "mul_k"],
+    [new RegExp(`^${ra}=${rb}\\/${c}$`), "div_k"],
+    [new RegExp(`^${ra}=${rb}%${c}$`), "mod_k"],
+    [new RegExp(`^${ra}=${b}\\+${rc}$`), "add_kr"],
+    [new RegExp(`^${ra}=${b}\\/${rc}$`), "div_kr"],
+    [new RegExp(`^${ra}\\(\\)$`), "call0_noret"],
+    [new RegExp(`^doreturn;end$`), "return_nil"],
+    [new RegExp(`^doreturn${ra};end$`), "return_one"],
+    [new RegExp(`^doreturn${ra}\\(\\);end$`), "return_call0"],
+    [new RegExp(`^${pc}=${b}$`), "jmp"]
+  ];
+
+  for (const [pattern, kind] of exact) {
+    if (pattern.test(text)) return { kind };
+  }
+
+  if (new RegExp(`(?:^|;)${ra}=${env}\\[${b}\\]$`).test(text)) return { kind: "getglobal" };
+  if (new RegExp(`(?:^|;)${ra}=${upvalues}\\[${b}\\]$`).test(text)) return { kind: "getupvalue" };
+  if (new RegExp(`(?:^|;)${ra}=${rb}\\[${c}\\]$`).test(text)) return { kind: "gettable_k" };
+  if (new RegExp(`(?:^|;)${ra}=${rb}\\[${rc}\\]$`).test(text)) return { kind: "gettable_r" };
+
+  let match = new RegExp(`^(?:local)?${temp}=${a};${r}\\[\\1\\]=${r}\\[\\1\\]\\(\\)$`).exec(text);
+  if (match) return { kind: "call0_assign1" };
+  match = new RegExp(`^(?:local)?${temp}=${a};${r}\\[\\1\\]=${r}\\[\\1\\]\\(${r}\\[\\1\\+1\\]\\)$`).exec(text);
+  if (match) return { kind: "call1_assign1" };
+  match = new RegExp(`^(?:local)?${temp}=${a};${r}\\[\\1\\]\\(${r}\\[\\1\\+1\\]\\)$`).exec(text);
+  if (match) return { kind: "call1_noret" };
+
+  match = new RegExp(`^(?:local)?${temp}=${a};${r}\\[\\1\\]=${r}\\[\\1\\]\\([A-Za-z_][A-Za-z0-9_]*\\(${r},\\1\\+1,${b}\\)\\)$`).exec(text);
+  if (match) return { kind: "call_b_assign1" };
+  match = new RegExp(`^(?:local)?${temp}=${a};${r}\\[\\1\\]\\([A-Za-z_][A-Za-z0-9_]*\\(${r},\\1\\+1,${b}\\)\\)$`).exec(text);
+  if (match) return { kind: "call_b_noret" };
+  match = new RegExp(`^(?:local)?${temp}=${a};${r}\\[\\1\\]=${r}\\[\\1\\]\\([A-Za-z_][A-Za-z0-9_]*\\(${r},\\1\\+1,${top}\\)\\)$`).exec(text);
+  if (match) return { kind: "call_var_assign1" };
+  match = new RegExp(`^(?:local)?${temp}=${a};${r}\\[\\1\\]\\([A-Za-z_][A-Za-z0-9_]*\\(${r},\\1\\+1,${top}\\)\\)$`).exec(text);
+  if (match) return { kind: "call_var_noret" };
+
+  match = new RegExp(`^(?:local)?${temp}=${a};(?:local)?([A-Za-z_][A-Za-z0-9_]*)=${rb};${r}\\[\\1\\+1\\]=\\2;${r}\\[\\1\\]=\\2\\[${c}\\]$`).exec(text);
+  if (match) return { kind: "self_k" };
+  match = new RegExp(`^(?:local)?${temp}=${a};(?:local)?([A-Za-z_][A-Za-z0-9_]*)=${rb};${r}\\[\\1\\+1\\]=\\2;${r}\\[\\1\\]=\\2\\[${rc}\\]$`).exec(text);
+  if (match) return { kind: "self_r" };
+  if (
+    new RegExp(`${temp}=${a};${temp}=${rb};${r}\\[\\1\\+1\\]=\\2;${r}\\[\\1\\]=\\2\\[${c}\\]$`).test(text)
+  ) {
+    return { kind: "self_k" };
+  }
+
+  if (new RegExp(`${factory}\\(${children}\\[${b}\\]`).test(text)) return { kind: "closure" };
+  if (
+    text.includes(`${factory}(`) &&
+    text.includes(`${pc}=${pc}+1`) &&
+    text.includes(`${runtime.instructionArrayName}[${pc}]`)
+  ) {
+    return { kind: "closure" };
+  }
+
+  if (text.includes(`for`) && new RegExp(`${r}\\[[A-Za-z_][A-Za-z0-9_]*\\]=nil`).test(text)) {
+    return { kind: "loadnil" };
+  }
+
+  if (
+    text.includes("..") &&
+    new RegExp(`${ra}=[A-Za-z_][A-Za-z0-9_]*$`).test(text)
+  ) {
+    return { kind: "concat" };
+  }
+
+  if (text.includes(`${runtime.openUpvaluesName ?? ""}`) && text.includes(`>=${a}`)) {
+    return { kind: "close" };
+  }
+
+  if (text.includes(`doreturn`) && text.includes(`${top}`)) return { kind: "return_varargs" };
+  if (
+    new RegExp(`doreturn${r}\\[[A-Za-z_][A-Za-z0-9_]*\\]\\([A-Za-z_][A-Za-z0-9_]*\\(${r},[A-Za-z_][A-Za-z0-9_]*\\+1,${b}\\)\\);end`).test(text)
+  ) {
+    return { kind: "return_call_b" };
+  }
+  if (text.includes(`doreturn`) && text.includes(`${b}`) && text.includes(`${r}`)) return { kind: "return_range" };
+
+  if (
+    text.includes(`{${r}[`) &&
+    text.includes(`${runtime.pcName}=${runtime.instructionName}[3]`) &&
+    text.includes(`${runtime.pcName}=${runtime.pcName}+1`) &&
+    text.includes("for")
+  ) {
+    return { kind: "tforloop" };
+  }
+
+  if (text.includes(`${top}=`) && text.includes(`${r}`) && text.includes("for")) {
+    if (text.includes(`${b}`)) return { kind: "call_b_multiret" };
+    return { kind: "call1_multiret" };
+  }
+
+  if (text.includes(`{${r}[`) && text.includes(`for`) && text.includes(`${c}`)) {
+    if (text.includes(`${top}`)) return { kind: "call_var_results" };
+    if (text.includes(`${b}`)) return { kind: "call_b_results" };
+    return { kind: "call1_results" };
+  }
+
+  if (
+    text.includes(`{${r}[`) &&
+    text.includes("for") &&
+    text.includes(`${i}[4]`)
+  ) {
+    if (text.includes(`${top}`)) return { kind: "call_var_results" };
+    if (text.includes(`${b}`)) return { kind: "call_b_results" };
+    return { kind: "call1_results" };
+  }
+
+  if (
+    new RegExp(`(?:local)?${temp}=${a};(?:local)?${temp}=${r}\\[\\1\\];for[A-Za-z_][A-Za-z0-9_]*=\\1\\+1,${top}do`).test(text)
+  ) {
+    return { kind: "append_varargs" };
+  }
+
+  if (
+    text.includes("for") &&
+    new RegExp(`${temp}=${a}`).test(text) &&
+    new RegExp(`${temp}=${r}\\[[A-Za-z_][A-Za-z0-9_]*\\]`).test(text) &&
+    new RegExp(`${temp}=${b}`).test(text) &&
+    text.includes(`${r}[`)
+  ) {
+    return { kind: "setlist" };
+  }
+
+  if (
+    text.includes(`for`) &&
+    text.includes(`${r}[`) &&
+    text.includes(`${a}`) &&
+    text.includes(`${b}`)
+  ) {
+    return { kind: "setlist" };
+  }
+
+  if (
+    text.includes(`#`) &&
+    text.includes(`>=`) &&
+    text.includes(`${r}`) &&
+    text.includes(`[1]=`)
+  ) {
+    return { kind: "close" };
+  }
+
+  if (
+    text.includes(`${r}[`) &&
+    text.includes("+2]") &&
+    text.includes("+1]") &&
+    text.includes("+3]") &&
+    text.includes(`${runtime.pcName}=${runtime.instructionName}[3]`)
+  ) {
+    return { kind: text.includes(`]+`) ? "forloop" : "forprep" };
+  }
+
+  if (
+    new RegExp(`^(?:local)?${temp}=${rc};ifnot\\1then`).test(text) &&
+    text.includes(`${runtime.pcName}=${runtime.pcName}+1`) &&
+    text.includes(`${runtime.registersName}[${runtime.instructionName}[2]]=`) &&
+    text.includes(`${runtime.pcName}=${runtime.instructionName}[3]`)
+  ) {
+    return { kind: "testset_truthy" };
+  }
+
+  if (
+    new RegExp(`^(?:local)?${temp}=${rc};if\\1then`).test(text) &&
+    text.includes(`${runtime.pcName}=${runtime.pcName}+1`) &&
+    text.includes(`${runtime.registersName}[${runtime.instructionName}[2]]=`) &&
+    text.includes(`${runtime.pcName}=${runtime.instructionName}[3]`)
+  ) {
+    return { kind: "testset_falsy" };
+  }
+
+  if (
+    text.includes(`for`) &&
+    text.includes(`${runtime.instructionName}[3]do`) &&
+    text.includes(`${runtime.registersName}[`) &&
+    text.includes(`+1`) &&
+    text.includes("(")
+  ) {
+    return { kind: "setlist_range" };
+  }
+
+  if (new RegExp(`^${ra}=${b}\\/${c}$`).test(text)) return { kind: "div_kk" };
+
+  return {
+    kind: "unknown",
+    handler: text
+  };
+}
+
+function classifySuperinstructionHandlers(analysis) {
+  for (const handler of analysis.handlers.values()) {
+    handler.microOps = handler.segments.map((segment) => classifySegment(analysis, segment));
+  }
+  return analysis;
+}
+
+function cloneExpandedProto(proto, analysis) {
+  const instructions = [];
+  let index = 0;
+
+  while (index < proto.instructions.length) {
+    const instruction = proto.instructions[index];
+    if (instruction.skipped) {
+      instructions.push({ ...instruction, kind: "skipped" });
+      index += 1;
+      continue;
+    }
+
+    const handler = analysis.handlers.get(instruction.op);
+    if (!handler?.microOps) {
+      instructions.push({ ...instruction, kind: "unknown", superOpcode: instruction.op });
+      index += 1;
+      continue;
+    }
+
+    for (let offset = 0; offset < handler.microOps.length && index + offset < proto.instructions.length; offset += 1) {
+      const consumed = proto.instructions[index + offset];
+      const microOp = handler.microOps[offset];
+      const captures = microOp.kind === "closure" && typeof consumed.c === "number"
+        ? proto.instructions.slice(index + offset + 1, index + offset + 1 + consumed.c).map((marker) => ({
+          source: marker.op === 19 ? "register" : "upvalue",
+          index: marker.b
+        }))
+        : undefined;
+      instructions.push({
+        ...consumed,
+        ...microOp,
+        pc: consumed.pc,
+        superPc: instruction.pc,
+        superOpcode: instruction.op,
+        superOffset: offset,
+        ...(captures ? { captures } : {})
+      });
+    }
+
+    const firstKind = handler.microOps[0]?.kind;
+    const consumed = firstKind === "closure" && typeof instruction.c === "number"
+      ? Math.max(handler.microOps.length, instruction.c + 1)
+      : handler.microOps.length;
+    index += Math.max(1, consumed);
+  }
+
+  return {
+    ...proto,
+    instructions,
+    protos: proto.protos.map((child) => cloneExpandedProto(child, analysis))
+  };
+}
+
+function expandSuperinstructionProto(proto, analysis) {
+  classifySuperinstructionHandlers(analysis);
+  return cloneExpandedProto(proto, analysis);
+}
+
+exports.analyzeSuperinstructionVm = analyzeSuperinstructionVm;
+exports.formatHandlerSegment = formatHandlerSegment;
+exports.classifySuperinstructionHandlers = classifySuperinstructionHandlers;
+exports.expandSuperinstructionProto = expandSuperinstructionProto;
+
+},{"luaparse":89,"../transforms/foldNumericNoise.js":90}],
+89:[function(module,exports,require,process){
+/* global exports:true, module:true, require:true, define:true, global:true */
+
+(function (root, name, factory) {
+  'use strict';
+
+  // Used to determine if values are of the language type `Object`
+  var objectTypes = {
+        'function': true
+      , 'object': true
+    }
+    // Detect free variable `exports`
+    , freeExports = objectTypes[typeof exports] && exports && !exports.nodeType && exports
+    // Detect free variable `module`
+    , freeModule = objectTypes[typeof module] && module && !module.nodeType && module
+    // Detect free variable `global`, from Node.js or Browserified code, and
+    // use it as `window`
+    , freeGlobal = freeExports && freeModule && typeof global === 'object' && global
+    // Detect the popular CommonJS extension `module.exports`
+    , moduleExports = freeModule && freeModule.exports === freeExports && freeExports;
+
+  /* istanbul ignore else */
+  if (freeGlobal && (freeGlobal.global === freeGlobal ||
+                     /* istanbul ignore next */ freeGlobal.window === freeGlobal ||
+                     /* istanbul ignore next */ freeGlobal.self === freeGlobal)) {
+    root = freeGlobal;
+  }
+
+  // Some AMD build optimizers, like r.js, check for specific condition
+  // patterns like the following:
+  /* istanbul ignore if */
+  if (typeof define === 'function' &&
+      /* istanbul ignore next */ typeof define.amd === 'object' &&
+      /* istanbul ignore next */ define.amd) {
+    // defined as an anonymous module.
+    define(['exports'], factory);
+    // In case the source has been processed and wrapped in a define module use
+    // the supplied `exports` object.
+    if (freeExports && moduleExports) factory(freeModule.exports);
+  }
+  // check for `exports` after `define` in case a build optimizer adds an
+  // `exports` object
+  else /* istanbul ignore else */ if (freeExports && freeModule) {
+    // in Node.js or RingoJS v0.8.0+
+    /* istanbul ignore else */
+    if (moduleExports) factory(freeModule.exports);
+    // in RingoJS v0.7.0-
+    else factory(freeExports);
+  }
+  // in a browser or Rhino
+  else {
+    factory((root[name] = {}));
+  }
+}(this, 'luaparse', function (exports) {
+  'use strict';
+
+  exports.version = "0.3.1";
+
+  var input, options, length, features, encodingMode;
+
+  // Options can be set either globally on the parser object through
+  // defaultOptions, or during the parse call.
+  var defaultOptions = exports.defaultOptions = {
+    // Explicitly tell the parser when the input ends.
+      wait: false
+    // Store comments as an array in the chunk object.
+    , comments: true
+    // Track identifier scopes by adding an isLocal attribute to each
+    // identifier-node.
+    , scope: false
+    // Store location information on each syntax node as
+    // `loc: { start: { line, column }, end: { line, column } }`.
+    , locations: false
+    // Store the start and end character locations on each syntax node as
+    // `range: [start, end]`.
+    , ranges: false
+    // A callback which will be invoked when a syntax node has been completed.
+    // The node which has been created will be passed as the only parameter.
+    , onCreateNode: null
+    // A callback which will be invoked when a new scope is created.
+    , onCreateScope: null
+    // A callback which will be invoked when the current scope is destroyed.
+    , onDestroyScope: null
+    // A callback which will be invoked when a local variable is declared in the current scope.
+    // The variable's name will be passed as the only parameter
+    , onLocalDeclaration: null
+    // The version of Lua targeted by the parser (string; allowed values are
+    // '5.1', '5.2', '5.3').
+    , luaVersion: '5.1'
+    // Encoding mode: how to interpret code units higher than U+007F in input
+    , encodingMode: 'none'
+  };
+
+  function encodeUTF8(codepoint, highMask) {
+    highMask = highMask || 0;
+
+    if (codepoint < 0x80) {
+      return String.fromCharCode(codepoint);
+    } else if (codepoint < 0x800) {
+      return String.fromCharCode(
+        highMask | 0xc0 |  (codepoint >>  6)        ,
+        highMask | 0x80 | ( codepoint        & 0x3f)
+      );
+    } else if (codepoint < 0x10000) {
+      return String.fromCharCode(
+        highMask | 0xe0 |  (codepoint >> 12)        ,
+        highMask | 0x80 | ((codepoint >>  6) & 0x3f),
+        highMask | 0x80 | ( codepoint        & 0x3f)
+      );
+    } else /* istanbul ignore else */ if (codepoint < 0x110000) {
+      return String.fromCharCode(
+        highMask | 0xf0 |  (codepoint >> 18)        ,
+        highMask | 0x80 | ((codepoint >> 12) & 0x3f),
+        highMask | 0x80 | ((codepoint >>  6) & 0x3f),
+        highMask | 0x80 | ( codepoint        & 0x3f)
+      );
+    } else {
+      // TODO: Lua 5.4 allows up to six-byte sequences, as in UTF-8:1993
+      return null;
+    }
+  }
+
+  function toHex(num, digits) {
+    var result = num.toString(16);
+    while (result.length < digits)
+      result = '0' + result;
+    return result;
+  }
+
+  function checkChars(rx) {
+    return function (s) {
+      var m = rx.exec(s);
+      if (!m)
+        return s;
+      raise(null, errors.invalidCodeUnit, toHex(m[0].charCodeAt(0), 4).toUpperCase());
+    };
+  }
+
+  var encodingModes = {
+    // `pseudo-latin1` encoding mode: assume the input was decoded with the latin1 encoding
+    // WARNING: latin1 does **NOT** mean cp1252 here like in the bone-headed WHATWG standard;
+    // it means true ISO/IEC 8859-1 identity-mapped to Basic Latin and Latin-1 Supplement blocks
+    'pseudo-latin1': {
+      fixup: checkChars(/[^\x00-\xff]/),
+      encodeByte: function (value) {
+        if (value === null)
+          return '';
+        return String.fromCharCode(value);
+      },
+      encodeUTF8: function (codepoint) {
+        return encodeUTF8(codepoint);
+      },
+    },
+
+    // `x-user-defined` encoding mode: assume the input was decoded with the WHATWG `x-user-defined` encoding
+    'x-user-defined': {
+      fixup: checkChars(/[^\x00-\x7f\uf780-\uf7ff]/),
+      encodeByte: function (value) {
+        if (value === null)
+          return '';
+        if (value >= 0x80)
+          return String.fromCharCode(value | 0xf700);
+        return String.fromCharCode(value);
+      },
+      encodeUTF8: function (codepoint) {
+        return encodeUTF8(codepoint, 0xf700);
+      }
+    },
+
+    // `none` encoding mode: disregard intrepretation of string literals, leave identifiers as-is
+    'none': {
+      discardStrings: true,
+      fixup: function (s) {
+        return s;
+      },
+      encodeByte: function (value) {
+        return '';
+      },
+      encodeUTF8: function (codepoint) {
+        return '';
+      }
+    }
+  };
+
+  // The available tokens expressed as enum flags so they can be checked with
+  // bitwise operations.
+
+  var EOF = 1, StringLiteral = 2, Keyword = 4, Identifier = 8
+    , NumericLiteral = 16, Punctuator = 32, BooleanLiteral = 64
+    , NilLiteral = 128, VarargLiteral = 256;
+
+  exports.tokenTypes = { EOF: EOF, StringLiteral: StringLiteral
+    , Keyword: Keyword, Identifier: Identifier, NumericLiteral: NumericLiteral
+    , Punctuator: Punctuator, BooleanLiteral: BooleanLiteral
+    , NilLiteral: NilLiteral, VarargLiteral: VarargLiteral
+  };
+
+  // As this parser is a bit different from luas own, the error messages
+  // will be different in some situations.
+
+  var errors = exports.errors = {
+      unexpected: 'unexpected %1 \'%2\' near \'%3\''
+    , unexpectedEOF: 'unexpected symbol near \'<eof>\''
+    , expected: '\'%1\' expected near \'%2\''
+    , expectedToken: '%1 expected near \'%2\''
+    , unfinishedString: 'unfinished string near \'%1\''
+    , malformedNumber: 'malformed number near \'%1\''
+    , decimalEscapeTooLarge: 'decimal escape too large near \'%1\''
+    , invalidEscape: 'invalid escape sequence near \'%1\''
+    , hexadecimalDigitExpected: 'hexadecimal digit expected near \'%1\''
+    , braceExpected: 'missing \'%1\' near \'%2\''
+    , tooLargeCodepoint: 'UTF-8 value too large near \'%1\''
+    , unfinishedLongString: 'unfinished long string (starting at line %1) near \'%2\''
+    , unfinishedLongComment: 'unfinished long comment (starting at line %1) near \'%2\''
+    , ambiguousSyntax: 'ambiguous syntax (function call x new statement) near \'%1\''
+    , noLoopToBreak: 'no loop to break near \'%1\''
+    , labelAlreadyDefined: 'label \'%1\' already defined on line %2'
+    , labelNotVisible: 'no visible label \'%1\' for <goto>'
+    , gotoJumpInLocalScope: '<goto %1> jumps into the scope of local \'%2\''
+    , cannotUseVararg: 'cannot use \'...\' outside a vararg function near \'%1\''
+    , invalidCodeUnit: 'code unit U+%1 is not allowed in the current encoding mode'
+  };
+
+  // ### Abstract Syntax Tree
+  //
+  // The default AST structure is inspired by the Mozilla Parser API but can
+  // easily be customized by overriding these functions.
+
+  var ast = exports.ast = {
+      labelStatement: function(label) {
+      return {
+          type: 'LabelStatement'
+        , label: label
+      };
+    }
+
+    , breakStatement: function() {
+      return {
+          type: 'BreakStatement'
+      };
+    }
+
+    , gotoStatement: function(label) {
+      return {
+          type: 'GotoStatement'
+        , label: label
+      };
+    }
+
+    , returnStatement: function(args) {
+      return {
+          type: 'ReturnStatement'
+        , 'arguments': args
+      };
+    }
+
+    , ifStatement: function(clauses) {
+      return {
+          type: 'IfStatement'
+        , clauses: clauses
+      };
+    }
+    , ifClause: function(condition, body) {
+      return {
+          type: 'IfClause'
+        , condition: condition
+        , body: body
+      };
+    }
+    , elseifClause: function(condition, body) {
+      return {
+          type: 'ElseifClause'
+        , condition: condition
+        , body: body
+      };
+    }
+    , elseClause: function(body) {
+      return {
+          type: 'ElseClause'
+        , body: body
+      };
+    }
+
+    , whileStatement: function(condition, body) {
+      return {
+          type: 'WhileStatement'
+        , condition: condition
+        , body: body
+      };
+    }
+
+    , doStatement: function(body) {
+      return {
+          type: 'DoStatement'
+        , body: body
+      };
+    }
+
+    , repeatStatement: function(condition, body) {
+      return {
+          type: 'RepeatStatement'
+        , condition: condition
+        , body: body
+      };
+    }
+
+    , localStatement: function(variables, init) {
+      return {
+          type: 'LocalStatement'
+        , variables: variables
+        , init: init
+      };
+    }
+
+    , assignmentStatement: function(variables, init) {
+      return {
+          type: 'AssignmentStatement'
+        , variables: variables
+        , init: init
+      };
+    }
+
+    , callStatement: function(expression) {
+      return {
+          type: 'CallStatement'
+        , expression: expression
+      };
+    }
+
+    , functionStatement: function(identifier, parameters, isLocal, body) {
+      return {
+          type: 'FunctionDeclaration'
+        , identifier: identifier
+        , isLocal: isLocal
+        , parameters: parameters
+        , body: body
+      };
+    }
+
+    , forNumericStatement: function(variable, start, end, step, body) {
+      return {
+          type: 'ForNumericStatement'
+        , variable: variable
+        , start: start
+        , end: end
+        , step: step
+        , body: body
+      };
+    }
+
+    , forGenericStatement: function(variables, iterators, body) {
+      return {
+          type: 'ForGenericStatement'
+        , variables: variables
+        , iterators: iterators
+        , body: body
+      };
+    }
+
+    , chunk: function(body) {
+      return {
+          type: 'Chunk'
+        , body: body
+      };
+    }
+
+    , identifier: function(name) {
+      return {
+          type: 'Identifier'
+        , name: name
+      };
+    }
+
+    , literal: function(type, value, raw) {
+      type = (type === StringLiteral) ? 'StringLiteral'
+        : (type === NumericLiteral) ? 'NumericLiteral'
+        : (type === BooleanLiteral) ? 'BooleanLiteral'
+        : (type === NilLiteral) ? 'NilLiteral'
+        : 'VarargLiteral';
+
+      return {
+          type: type
+        , value: value
+        , raw: raw
+      };
+    }
+
+    , tableKey: function(key, value) {
+      return {
+          type: 'TableKey'
+        , key: key
+        , value: value
+      };
+    }
+    , tableKeyString: function(key, value) {
+      return {
+          type: 'TableKeyString'
+        , key: key
+        , value: value
+      };
+    }
+    , tableValue: function(value) {
+      return {
+          type: 'TableValue'
+        , value: value
+      };
+    }
+
+
+    , tableConstructorExpression: function(fields) {
+      return {
+          type: 'TableConstructorExpression'
+        , fields: fields
+      };
+    }
+    , binaryExpression: function(operator, left, right) {
+      var type = ('and' === operator || 'or' === operator) ?
+        'LogicalExpression' :
+        'BinaryExpression';
+
+      return {
+          type: type
+        , operator: operator
+        , left: left
+        , right: right
+      };
+    }
+    , unaryExpression: function(operator, argument) {
+      return {
+          type: 'UnaryExpression'
+        , operator: operator
+        , argument: argument
+      };
+    }
+    , memberExpression: function(base, indexer, identifier) {
+      return {
+          type: 'MemberExpression'
+        , indexer: indexer
+        , identifier: identifier
+        , base: base
+      };
+    }
+
+    , indexExpression: function(base, index) {
+      return {
+          type: 'IndexExpression'
+        , base: base
+        , index: index
+      };
+    }
+
+    , callExpression: function(base, args) {
+      return {
+          type: 'CallExpression'
+        , base: base
+        , 'arguments': args
+      };
+    }
+
+    , tableCallExpression: function(base, args) {
+      return {
+          type: 'TableCallExpression'
+        , base: base
+        , 'arguments': args
+      };
+    }
+
+    , stringCallExpression: function(base, argument) {
+      return {
+          type: 'StringCallExpression'
+        , base: base
+        , argument: argument
+      };
+    }
+
+    , comment: function(value, raw) {
+      return {
+          type: 'Comment'
+        , value: value
+        , raw: raw
+      };
+    }
+  };
+
+  // Wrap up the node object.
+
+  function finishNode(node) {
+    // Pop a `Marker` off the location-array and attach its location data.
+    if (trackLocations) {
+      var location = locations.pop();
+      location.complete();
+      location.bless(node);
+    }
+    if (options.onCreateNode) options.onCreateNode(node);
+    return node;
+  }
+
+
+  // Helpers
+  // -------
+
+  var slice = Array.prototype.slice
+    , toString = Object.prototype.toString
+    ;
+
+  var indexOf = /* istanbul ignore next */ function (array, element) {
+    for (var i = 0, length = array.length; i < length; ++i) {
+      if (array[i] === element) return i;
+    }
+    return -1;
+  };
+
+  /* istanbul ignore else */
+  if (Array.prototype.indexOf)
+    indexOf = function (array, element) {
+      return array.indexOf(element);
+    };
+
+  // Iterate through an array of objects and return the index of an object
+  // with a matching property.
+
+  function indexOfObject(array, property, element) {
+    for (var i = 0, length = array.length; i < length; ++i) {
+      if (array[i][property] === element) return i;
+    }
+    return -1;
+  }
+
+  // A sprintf implementation using %index (beginning at 1) to input
+  // arguments in the format string.
+  //
+  // Example:
+  //
+  //     // Unexpected function in token
+  //     sprintf('Unexpected %2 in %1.', 'token', 'function');
+
+  function sprintf(format) {
+    var args = slice.call(arguments, 1);
+    format = format.replace(/%(\d)/g, function (match, index) {
+      return '' + args[index - 1] || /* istanbul ignore next */ '';
+    });
+    return format;
+  }
+
+  // Polyfill for `Object.assign`.
+
+  var assign = /* istanbul ignore next */ function (dest) {
+    var args = slice.call(arguments, 1)
+      , src, prop;
+
+    for (var i = 0, length = args.length; i < length; ++i) {
+      src = args[i];
+      for (prop in src)
+        /* istanbul ignore else */
+        if (Object.prototype.hasOwnProperty.call(src, prop)) {
+          dest[prop] = src[prop];
+        }
+    }
+
+    return dest;
+  };
+
+  /* istanbul ignore else */
+  if (Object.assign)
+    assign = Object.assign;
+
+  // ### Error functions
+
+  exports.SyntaxError = SyntaxError;
+
+  // XXX: Eliminate this function and change the error type to be different from SyntaxError.
+  // This will unfortunately be a breaking change, because some downstream users depend
+  // on the error thrown being an instance of SyntaxError. For example, the Ace editor:
+  // <https://github.com/ajaxorg/ace/blob/4c7e5eb3f5d5ca9434847be51834a4e41661b852/lib/ace/mode/lua_worker.js#L55>
+
+  function fixupError(e) {
+    /* istanbul ignore if */
+    if (!Object.create)
+      return e;
+    return Object.create(e, {
+      'line': { 'writable': true, value: e.line },
+      'index': { 'writable': true, value: e.index },
+      'column': { 'writable': true, value: e.column }
+    });
+  }
+
+  // #### Raise an exception.
+  //
+  // Raise an exception by passing a token, a string format and its paramters.
+  //
+  // The passed tokens location will automatically be added to the error
+  // message if it exists, if not it will default to the lexers current
+  // position.
+  //
+  // Example:
+  //
+  //     // [1:0] expected [ near (
+  //     raise(token, "expected %1 near %2", '[', token.value);
+
+  function raise(token) {
+    var message = sprintf.apply(null, slice.call(arguments, 1))
+      , error, col;
+
+    if (token === null || typeof token.line === 'undefined') {
+      col = index - lineStart + 1;
+      error = fixupError(new SyntaxError(sprintf('[%1:%2] %3', line, col, message)));
+      error.index = index;
+      error.line = line;
+      error.column = col;
+    } else {
+      col = token.range[0] - token.lineStart;
+      error = fixupError(new SyntaxError(sprintf('[%1:%2] %3', token.line, col, message)));
+      error.line = token.line;
+      error.index = token.range[0];
+      error.column = col;
+    }
+    throw error;
+  }
+
+  function tokenValue(token) {
+    var raw = input.slice(token.range[0], token.range[1]);
+    if (raw)
+      return raw;
+    return token.value;
+  }
+
+  // #### Raise an unexpected token error.
+  //
+  // Example:
+  //
+  //     // expected <name> near '0'
+  //     raiseUnexpectedToken('<name>', token);
+
+  function raiseUnexpectedToken(type, token) {
+    raise(token, errors.expectedToken, type, tokenValue(token));
+  }
+
+  // #### Raise a general unexpected error
+  //
+  // Usage should pass either a token object or a symbol string which was
+  // expected. We can also specify a nearby token such as <eof>, this will
+  // default to the currently active token.
+  //
+  // Example:
+  //
+  //     // Unexpected symbol 'end' near '<eof>'
+  //     unexpected(token);
+  //
+  // If there's no token in the buffer it means we have reached <eof>.
+
+  function unexpected(found) {
+    var near = tokenValue(lookahead);
+    if ('undefined' !== typeof found.type) {
+      var type;
+      switch (found.type) {
+        case StringLiteral:   type = 'string';      break;
+        case Keyword:         type = 'keyword';     break;
+        case Identifier:      type = 'identifier';  break;
+        case NumericLiteral:  type = 'number';      break;
+        case Punctuator:      type = 'symbol';      break;
+        case BooleanLiteral:  type = 'boolean';     break;
+        case NilLiteral:
+          return raise(found, errors.unexpected, 'symbol', 'nil', near);
+        case EOF:
+          return raise(found, errors.unexpectedEOF);
+      }
+      return raise(found, errors.unexpected, type, tokenValue(found), near);
+    }
+    return raise(found, errors.unexpected, 'symbol', found, near);
+  }
+
+  // Lexer
+  // -----
+  //
+  // The lexer, or the tokenizer reads the input string character by character
+  // and derives a token left-right. To be as efficient as possible the lexer
+  // prioritizes the common cases such as identifiers. It also works with
+  // character codes instead of characters as string comparisons was the
+  // biggest bottleneck of the parser.
+  //
+  // If `options.comments` is enabled, all comments encountered will be stored
+  // in an array which later will be appended to the chunk object. If disabled,
+  // they will simply be disregarded.
+  //
+  // When the lexer has derived a valid token, it will be returned as an object
+  // containing its value and as well as its position in the input string (this
+  // is always enabled to provide proper debug messages).
+  //
+  // `lex()` starts lexing and returns the following token in the stream.
+
+  var index
+    , token
+    , previousToken
+    , lookahead
+    , comments
+    , tokenStart
+    , line
+    , lineStart;
+
+  exports.lex = lex;
+
+  function lex() {
+    skipWhiteSpace();
+
+    // Skip comments beginning with --
+    while (45 === input.charCodeAt(index) &&
+           45 === input.charCodeAt(index + 1)) {
+      scanComment();
+      skipWhiteSpace();
+    }
+    if (index >= length) return {
+        type : EOF
+      , value: '<eof>'
+      , line: line
+      , lineStart: lineStart
+      , range: [index, index]
+    };
+
+    var charCode = input.charCodeAt(index)
+      , next = input.charCodeAt(index + 1);
+
+    // Memorize the range index where the token begins.
+    tokenStart = index;
+    if (isIdentifierStart(charCode)) return scanIdentifierOrKeyword();
+
+    switch (charCode) {
+      case 39: case 34: // '"
+        return scanStringLiteral();
+
+      case 48: case 49: case 50: case 51: case 52: case 53:
+      case 54: case 55: case 56: case 57: // 0-9
+        return scanNumericLiteral();
+
+      case 46: // .
+        // If the dot is followed by a digit it's a float.
+        if (isDecDigit(next)) return scanNumericLiteral();
+        if (46 === next) {
+          if (46 === input.charCodeAt(index + 2)) return scanVarargLiteral();
+          return scanPunctuator('..');
+        }
+        return scanPunctuator('.');
+
+      case 61: // =
+        if (61 === next) return scanPunctuator('==');
+        return scanPunctuator('=');
+
+      case 62: // >
+        if (features.bitwiseOperators)
+          if (62 === next) return scanPunctuator('>>');
+        if (61 === next) return scanPunctuator('>=');
+        return scanPunctuator('>');
+
+      case 60: // <
+        if (features.bitwiseOperators)
+          if (60 === next) return scanPunctuator('<<');
+        if (61 === next) return scanPunctuator('<=');
+        return scanPunctuator('<');
+
+      case 126: // ~
+        if (61 === next) return scanPunctuator('~=');
+        if (!features.bitwiseOperators)
+          break;
+        return scanPunctuator('~');
+
+      case 58: // :
+        if (features.labels)
+          if (58 === next) return scanPunctuator('::');
+        return scanPunctuator(':');
+
+      case 91: // [
+        // Check for a multiline string, they begin with [= or [[
+        if (91 === next || 61 === next) return scanLongStringLiteral();
+        return scanPunctuator('[');
+
+      case 47: // /
+        // Check for integer division op (//)
+        if (features.integerDivision)
+          if (47 === next) return scanPunctuator('//');
+        return scanPunctuator('/');
+
+      case 38: case 124: // & |
+        if (!features.bitwiseOperators)
+          break;
+
+        /* fall through */
+      case 42: case 94: case 37: case 44: case 123: case 125:
+      case 93: case 40: case 41: case 59: case 35: case 45:
+      case 43: // * ^ % , { } ] ( ) ; # - +
+        return scanPunctuator(input.charAt(index));
+    }
+
+    return unexpected(input.charAt(index));
+  }
+
+  // Whitespace has no semantic meaning in lua so simply skip ahead while
+  // tracking the encounted newlines. Any kind of eol sequence is counted as a
+  // single line.
+
+  function consumeEOL() {
+    var charCode = input.charCodeAt(index)
+      , peekCharCode = input.charCodeAt(index + 1);
+
+    if (isLineTerminator(charCode)) {
+      // Count \n\r and \r\n as one newline.
+      if (10 === charCode && 13 === peekCharCode) ++index;
+      if (13 === charCode && 10 === peekCharCode) ++index;
+      ++line;
+      lineStart = ++index;
+
+      return true;
+    }
+    return false;
+  }
+
+  function skipWhiteSpace() {
+    while (index < length) {
+      var charCode = input.charCodeAt(index);
+      if (isWhiteSpace(charCode)) {
+        ++index;
+      } else if (!consumeEOL()) {
+        break;
+      }
+    }
+  }
+
+  // Identifiers, keywords, booleans and nil all look the same syntax wise. We
+  // simply go through them one by one and defaulting to an identifier if no
+  // previous case matched.
+
+  function scanIdentifierOrKeyword() {
+    var value, type;
+
+    // Slicing the input string is prefered before string concatenation in a
+    // loop for performance reasons.
+    while (isIdentifierPart(input.charCodeAt(++index)));
+    value = encodingMode.fixup(input.slice(tokenStart, index));
+
+    // Decide on the token type and possibly cast the value.
+    if (isKeyword(value)) {
+      type = Keyword;
+    } else if ('true' === value || 'false' === value) {
+      type = BooleanLiteral;
+      value = ('true' === value);
+    } else if ('nil' === value) {
+      type = NilLiteral;
+      value = null;
+    } else {
+      type = Identifier;
+    }
+
+    return {
+        type: type
+      , value: value
+      , line: line
+      , lineStart: lineStart
+      , range: [tokenStart, index]
+    };
+  }
+
+  // Once a punctuator reaches this function it should already have been
+  // validated so we simply return it as a token.
+
+  function scanPunctuator(value) {
+    index += value.length;
+    return {
+        type: Punctuator
+      , value: value
+      , line: line
+      , lineStart: lineStart
+      , range: [tokenStart, index]
+    };
+  }
+
+  // A vararg literal consists of three dots.
+
+  function scanVarargLiteral() {
+    index += 3;
+    return {
+        type: VarargLiteral
+      , value: '...'
+      , line: line
+      , lineStart: lineStart
+      , range: [tokenStart, index]
+    };
+  }
+
+  // Find the string literal by matching the delimiter marks used.
+
+  function scanStringLiteral() {
+    var delimiter = input.charCodeAt(index++)
+      , beginLine = line
+      , beginLineStart = lineStart
+      , stringStart = index
+      , string = encodingMode.discardStrings ? null : ''
+      , charCode;
+
+    for (;;) {
+      charCode = input.charCodeAt(index++);
+      if (delimiter === charCode) break;
+      // EOF or `\n` terminates a string literal. If we haven't found the
+      // ending delimiter by now, raise an exception.
+      if (index > length || isLineTerminator(charCode)) {
+        string += input.slice(stringStart, index - 1);
+        raise(null, errors.unfinishedString, input.slice(tokenStart, index - 1));
+      }
+      if (92 === charCode) { // backslash
+        if (!encodingMode.discardStrings) {
+          var beforeEscape = input.slice(stringStart, index - 1);
+          string += encodingMode.fixup(beforeEscape);
+        }
+        var escapeValue = readEscapeSequence();
+        if (!encodingMode.discardStrings)
+          string += escapeValue;
+        stringStart = index;
+      }
+    }
+    if (!encodingMode.discardStrings) {
+      string += encodingMode.encodeByte(null);
+      string += encodingMode.fixup(input.slice(stringStart, index - 1));
+    }
+
+    return {
+        type: StringLiteral
+      , value: string
+      , line: beginLine
+      , lineStart: beginLineStart
+      , lastLine: line
+      , lastLineStart: lineStart
+      , range: [tokenStart, index]
+    };
+  }
+
+  // Expect a multiline string literal and return it as a regular string
+  // literal, if it doesn't validate into a valid multiline string, throw an
+  // exception.
+
+  function scanLongStringLiteral() {
+    var beginLine = line
+      , beginLineStart = lineStart
+      , string = readLongString(false);
+    // Fail if it's not a multiline literal.
+    if (false === string) raise(token, errors.expected, '[', tokenValue(token));
+
+    return {
+        type: StringLiteral
+      , value: encodingMode.discardStrings ? null : encodingMode.fixup(string)
+      , line: beginLine
+      , lineStart: beginLineStart
+      , lastLine: line
+      , lastLineStart: lineStart
+      , range: [tokenStart, index]
+    };
+  }
+
+  // Numeric literals will be returned as floating-point numbers instead of
+  // strings. The raw value should be retrieved from slicing the input string
+  // later on in the process.
+  //
+  // If a hexadecimal number is encountered, it will be converted.
+
+  function scanNumericLiteral() {
+    var character = input.charAt(index)
+      , next = input.charAt(index + 1);
+
+    var literal = ('0' === character && 'xX'.indexOf(next || null) >= 0) ?
+      readHexLiteral() : readDecLiteral();
+
+    var foundImaginaryUnit = readImaginaryUnitSuffix()
+      , foundInt64Suffix = readInt64Suffix();
+
+    if (foundInt64Suffix && (foundImaginaryUnit || literal.hasFractionPart)) {
+      raise(null, errors.malformedNumber, input.slice(tokenStart, index));
+    }
+
+    return {
+        type: NumericLiteral
+      , value: literal.value
+      , line: line
+      , lineStart: lineStart
+      , range: [tokenStart, index]
+    };
+  }
+
+  function readImaginaryUnitSuffix() {
+    if (!features.imaginaryNumbers) return;
+
+    // Imaginary unit number suffix is optional.
+    // See http://luajit.org/ext_ffi_api.html#literals
+    if ('iI'.indexOf(input.charAt(index) || null) >= 0) {
+      ++index;
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  function readInt64Suffix() {
+    if (!features.integerSuffixes) return;
+
+    // Int64/uint64 number suffix is optional.
+    // See http://luajit.org/ext_ffi_api.html#literals
+
+    if ('uU'.indexOf(input.charAt(index) || null) >= 0) {
+      ++index;
+      if ('lL'.indexOf(input.charAt(index) || null) >= 0) {
+        ++index;
+        if ('lL'.indexOf(input.charAt(index) || null) >= 0) {
+          ++index;
+          return 'ULL';
+        } else {
+          // UL but no L
+          raise(null, errors.malformedNumber, input.slice(tokenStart, index));
+        }
+      } else {
+        // U but no L
+        raise(null, errors.malformedNumber, input.slice(tokenStart, index));
+      }
+    } else if ('lL'.indexOf(input.charAt(index) || null) >= 0) {
+        ++index;
+        if ('lL'.indexOf(input.charAt(index) || null) >= 0) {
+          ++index;
+          return 'LL';
+        } else {
+          // First L but no second L
+          raise(null, errors.malformedNumber, input.slice(tokenStart, index));
+        }
+    }
+  }
+
+  // Lua hexadecimals have an optional fraction part and an optional binary
+  // exoponent part. These are not included in JavaScript so we will compute
+  // all three parts separately and then sum them up at the end of the function
+  // with the following algorithm.
+  //
+  //     Digit := toDec(digit)
+  //     Fraction := toDec(fraction) / 16 ^ fractionCount
+  //     BinaryExp := 2 ^ binaryExp
+  //     Number := ( Digit + Fraction ) * BinaryExp
+
+  function readHexLiteral() {
+    var fraction = 0 // defaults to 0 as it gets summed
+      , binaryExponent = 1 // defaults to 1 as it gets multiplied
+      , binarySign = 1 // positive
+      , digit, fractionStart, exponentStart, digitStart;
+
+    digitStart = index += 2; // Skip 0x part
+
+    // A minimum of one hex digit is required.
+    if (!isHexDigit(input.charCodeAt(index)))
+      raise(null, errors.malformedNumber, input.slice(tokenStart, index));
+
+    while (isHexDigit(input.charCodeAt(index))) ++index;
+    // Convert the hexadecimal digit to base 10.
+    digit = parseInt(input.slice(digitStart, index), 16);
+
+    // Fraction part is optional.
+    var foundFraction = false;
+    if ('.' === input.charAt(index)) {
+      foundFraction = true;
+      fractionStart = ++index;
+
+      while (isHexDigit(input.charCodeAt(index))) ++index;
+      fraction = input.slice(fractionStart, index);
+
+      // Empty fraction parts should default to 0, others should be converted
+      // 0.x form so we can use summation at the end.
+      fraction = (fractionStart === index) ? 0
+        : parseInt(fraction, 16) / Math.pow(16, index - fractionStart);
+    }
+
+    // Binary exponents are optional
+    var foundBinaryExponent = false;
+    if ('pP'.indexOf(input.charAt(index) || null) >= 0) {
+      foundBinaryExponent = true;
+      ++index;
+
+      // Sign part is optional and defaults to 1 (positive).
+      if ('+-'.indexOf(input.charAt(index) || null) >= 0)
+        binarySign = ('+' === input.charAt(index++)) ? 1 : -1;
+
+      exponentStart = index;
+
+      // The binary exponent sign requires a decimal digit.
+      if (!isDecDigit(input.charCodeAt(index)))
+        raise(null, errors.malformedNumber, input.slice(tokenStart, index));
+
+      while (isDecDigit(input.charCodeAt(index))) ++index;
+      binaryExponent = input.slice(exponentStart, index);
+
+      // Calculate the binary exponent of the number.
+      binaryExponent = Math.pow(2, binaryExponent * binarySign);
+    }
+
+    return {
+      value: (digit + fraction) * binaryExponent,
+      hasFractionPart: foundFraction || foundBinaryExponent
+    };
+  }
+
+  // Decimal numbers are exactly the same in Lua and in JavaScript, because of
+  // this we check where the token ends and then parse it with native
+  // functions.
+
+  function readDecLiteral() {
+    while (isDecDigit(input.charCodeAt(index))) ++index;
+    // Fraction part is optional
+    var foundFraction = false;
+    if ('.' === input.charAt(index)) {
+      foundFraction = true;
+      ++index;
+      // Fraction part defaults to 0
+      while (isDecDigit(input.charCodeAt(index))) ++index;
+    }
+
+    // Exponent part is optional.
+    var foundExponent = false;
+    if ('eE'.indexOf(input.charAt(index) || null) >= 0) {
+      foundExponent = true;
+      ++index;
+      // Sign part is optional.
+      if ('+-'.indexOf(input.charAt(index) || null) >= 0) ++index;
+      // An exponent is required to contain at least one decimal digit.
+      if (!isDecDigit(input.charCodeAt(index)))
+        raise(null, errors.malformedNumber, input.slice(tokenStart, index));
+
+      while (isDecDigit(input.charCodeAt(index))) ++index;
+    }
+
+    return {
+      value: parseFloat(input.slice(tokenStart, index)),
+      hasFractionPart: foundFraction || foundExponent
+    };
+  }
+
+  function readUnicodeEscapeSequence() {
+    var sequenceStart = index++;
+
+    if (input.charAt(index++) !== '{')
+      raise(null, errors.braceExpected, '{', '\\' + input.slice(sequenceStart, index));
+    if (!isHexDigit(input.charCodeAt(index)))
+      raise(null, errors.hexadecimalDigitExpected, '\\' + input.slice(sequenceStart, index));
+
+    while (input.charCodeAt(index) === 0x30) ++index;
+    var escStart = index;
+
+    while (isHexDigit(input.charCodeAt(index))) {
+      ++index;
+      if (index - escStart > 6)
+        raise(null, errors.tooLargeCodepoint, '\\' + input.slice(sequenceStart, index));
+    }
+
+    var b = input.charAt(index++);
+    if (b !== '}') {
+      if ((b === '"') || (b === "'"))
+        raise(null, errors.braceExpected, '}', '\\' + input.slice(sequenceStart, index--));
+      else
+        raise(null, errors.hexadecimalDigitExpected, '\\' + input.slice(sequenceStart, index));
+    }
+
+    var codepoint = parseInt(input.slice(escStart, index - 1) || '0', 16);
+    var frag = '\\' + input.slice(sequenceStart, index);
+
+    if (codepoint > 0x10ffff) {
+      raise(null, errors.tooLargeCodepoint, frag);
+    }
+
+    return encodingMode.encodeUTF8(codepoint, frag);
+  }
+
+  // Translate escape sequences to the actual characters.
+  function readEscapeSequence() {
+    var sequenceStart = index;
+    switch (input.charAt(index)) {
+      // Lua allow the following escape sequences.
+      case 'a': ++index; return '\x07';
+      case 'n': ++index; return '\n';
+      case 'r': ++index; return '\r';
+      case 't': ++index; return '\t';
+      case 'v': ++index; return '\x0b';
+      case 'b': ++index; return '\b';
+      case 'f': ++index; return '\f';
+
+      // Backslash at the end of the line. We treat all line endings as equivalent,
+      // and as representing the [LF] character (code 10). Lua 5.1 through 5.3
+      // have been verified to behave the same way.
+      case '\r':
+      case '\n':
+        consumeEOL();
+        return '\n';
+
+      case '0': case '1': case '2': case '3': case '4':
+      case '5': case '6': case '7': case '8': case '9':
+        // \ddd, where ddd is a sequence of up to three decimal digits.
+        while (isDecDigit(input.charCodeAt(index)) && index - sequenceStart < 3) ++index;
+
+        var frag = input.slice(sequenceStart, index);
+        var ddd = parseInt(frag, 10);
+        if (ddd > 255) {
+          raise(null, errors.decimalEscapeTooLarge, '\\' + ddd);
+        }
+        return encodingMode.encodeByte(ddd, '\\' + frag);
+
+      case 'z':
+        if (features.skipWhitespaceEscape) {
+          ++index;
+          skipWhiteSpace();
+          return '';
+        }
+        break;
+
+      case 'x':
+        if (features.hexEscapes) {
+          // \xXX, where XX is a sequence of exactly two hexadecimal digits
+          if (isHexDigit(input.charCodeAt(index + 1)) &&
+              isHexDigit(input.charCodeAt(index + 2))) {
+            index += 3;
+            return encodingMode.encodeByte(parseInt(input.slice(sequenceStart + 1, index), 16), '\\' + input.slice(sequenceStart, index));
+          }
+          raise(null, errors.hexadecimalDigitExpected, '\\' + input.slice(sequenceStart, index + 2));
+        }
+        break;
+
+      case 'u':
+        if (features.unicodeEscapes)
+          return readUnicodeEscapeSequence();
+        break;
+
+      case '\\': case '"': case "'":
+        return input.charAt(index++);
+    }
+
+    if (features.strictEscapes)
+      raise(null, errors.invalidEscape, '\\' + input.slice(sequenceStart, index + 1));
+    return input.charAt(index++);
+  }
+
+  // Comments begin with -- after which it will be decided if they are
+  // multiline comments or not.
+  //
+  // The multiline functionality works the exact same way as with string
+  // literals so we reuse the functionality.
+
+  function scanComment() {
+    tokenStart = index;
+    index += 2; // --
+
+    var character = input.charAt(index)
+      , content = ''
+      , isLong = false
+      , commentStart = index
+      , lineStartComment = lineStart
+      , lineComment = line;
+
+    if ('[' === character) {
+      content = readLongString(true);
+      // This wasn't a multiline comment after all.
+      if (false === content) content = character;
+      else isLong = true;
+    }
+    // Scan until next line as long as it's not a multiline comment.
+    if (!isLong) {
+      while (index < length) {
+        if (isLineTerminator(input.charCodeAt(index))) break;
+        ++index;
+      }
+      if (options.comments) content = input.slice(commentStart, index);
+    }
+
+    if (options.comments) {
+      var node = ast.comment(content, input.slice(tokenStart, index));
+
+      // `Marker`s depend on tokens available in the parser and as comments are
+      // intercepted in the lexer all location data is set manually.
+      if (options.locations) {
+        node.loc = {
+            start: { line: lineComment, column: tokenStart - lineStartComment }
+          , end: { line: line, column: index - lineStart }
+        };
+      }
+      if (options.ranges) {
+        node.range = [tokenStart, index];
+      }
+      if (options.onCreateNode) options.onCreateNode(node);
+      comments.push(node);
+    }
+  }
+
+  // Read a multiline string by calculating the depth of `=` characters and
+  // then appending until an equal depth is found.
+
+  function readLongString(isComment) {
+    var level = 0
+      , content = ''
+      , terminator = false
+      , character, stringStart, firstLine = line;
+
+    ++index; // [
+
+    // Calculate the depth of the comment.
+    while ('=' === input.charAt(index + level)) ++level;
+    // Exit, this is not a long string afterall.
+    if ('[' !== input.charAt(index + level)) return false;
+
+    index += level + 1;
+
+    // If the first character is a newline, ignore it and begin on next line.
+    if (isLineTerminator(input.charCodeAt(index))) consumeEOL();
+
+    stringStart = index;
+    while (index < length) {
+      // To keep track of line numbers run the `consumeEOL()` which increments
+      // its counter.
+      while (isLineTerminator(input.charCodeAt(index))) consumeEOL();
+
+      character = input.charAt(index++);
+
+      // Once the delimiter is found, iterate through the depth count and see
+      // if it matches.
+      if (']' === character) {
+        terminator = true;
+        for (var i = 0; i < level; ++i) {
+          if ('=' !== input.charAt(index + i)) terminator = false;
+        }
+        if (']' !== input.charAt(index + level)) terminator = false;
+      }
+
+      // We reached the end of the multiline string. Get out now.
+      if (terminator) {
+        content += input.slice(stringStart, index - 1);
+        index += level + 1;
+        return content;
+      }
+    }
+
+    raise(null, isComment ?
+                errors.unfinishedLongComment :
+                errors.unfinishedLongString,
+          firstLine, '<eof>');
+  }
+
+  // ## Lex functions and helpers.
+
+  // Read the next token.
+  //
+  // This is actually done by setting the current token to the lookahead and
+  // reading in the new lookahead token.
+
+  function next() {
+    previousToken = token;
+    token = lookahead;
+    lookahead = lex();
+  }
+
+  // Consume a token if its value matches. Once consumed or not, return the
+  // success of the operation.
+
+  function consume(value) {
+    if (value === token.value) {
+      next();
+      return true;
+    }
+    return false;
+  }
+
+  // Expect the next token value to match. If not, throw an exception.
+
+  function expect(value) {
+    if (value === token.value) next();
+    else raise(token, errors.expected, value, tokenValue(token));
+  }
+
+  // ### Validation functions
+
+  function isWhiteSpace(charCode) {
+    return 9 === charCode || 32 === charCode || 0xB === charCode || 0xC === charCode;
+  }
+
+  function isLineTerminator(charCode) {
+    return 10 === charCode || 13 === charCode;
+  }
+
+  function isDecDigit(charCode) {
+    return charCode >= 48 && charCode <= 57;
+  }
+
+  function isHexDigit(charCode) {
+    return (charCode >= 48 && charCode <= 57) || (charCode >= 97 && charCode <= 102) || (charCode >= 65 && charCode <= 70);
+  }
+
+  // From [Lua 5.2](http://www.lua.org/manual/5.2/manual.html#8.1) onwards
+  // identifiers cannot use 'locale-dependent' letters (i.e. dependent on the C locale).
+  // On the other hand, LuaJIT allows arbitrary octets ≥ 128 in identifiers.
+
+  function isIdentifierStart(charCode) {
+    if ((charCode >= 65 && charCode <= 90) || (charCode >= 97 && charCode <= 122) || 95 === charCode)
+      return true;
+    if (features.extendedIdentifiers && charCode >= 128)
+      return true;
+    return false;
+  }
+
+  function isIdentifierPart(charCode) {
+    if ((charCode >= 65 && charCode <= 90) || (charCode >= 97 && charCode <= 122) || 95 === charCode || (charCode >= 48 && charCode <= 57))
+      return true;
+    if (features.extendedIdentifiers && charCode >= 128)
+      return true;
+    return false;
+  }
+
+  // [3.1 Lexical Conventions](http://www.lua.org/manual/5.2/manual.html#3.1)
+  //
+  // `true`, `false` and `nil` will not be considered keywords, but literals.
+
+  function isKeyword(id) {
+    switch (id.length) {
+      case 2:
+        return 'do' === id || 'if' === id || 'in' === id || 'or' === id;
+      case 3:
+        return 'and' === id || 'end' === id || 'for' === id || 'not' === id;
+      case 4:
+        if ('else' === id || 'then' === id)
+          return true;
+        if (features.labels && !features.contextualGoto)
+          return ('goto' === id);
+        return false;
+      case 5:
+        return 'break' === id || 'local' === id || 'until' === id || 'while' === id;
+      case 6:
+        return 'elseif' === id || 'repeat' === id || 'return' === id;
+      case 8:
+        return 'function' === id;
+    }
+    return false;
+  }
+
+  function isUnary(token) {
+    if (Punctuator === token.type) return '#-~'.indexOf(token.value) >= 0;
+    if (Keyword === token.type) return 'not' === token.value;
+    return false;
+  }
+
+  // Check if the token syntactically closes a block.
+
+  function isBlockFollow(token) {
+    if (EOF === token.type) return true;
+    if (Keyword !== token.type) return false;
+    switch (token.value) {
+      case 'else': case 'elseif':
+      case 'end': case 'until':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // Scope
+  // -----
+
+  // Store each block scope as a an array of identifier names. Each scope is
+  // stored in an FILO-array.
+  var scopes
+    // The current scope index
+    , scopeDepth
+    // A list of all global identifier nodes.
+    , globals;
+
+  // Create a new scope inheriting all declarations from the previous scope.
+  function createScope() {
+    var scope = scopes[scopeDepth++].slice();
+    scopes.push(scope);
+    if (options.onCreateScope) options.onCreateScope();
+  }
+
+  // Exit and remove the current scope.
+  function destroyScope() {
+    var scope = scopes.pop();
+    --scopeDepth;
+    if (options.onDestroyScope) options.onDestroyScope();
+  }
+
+  // Add identifier name to the current scope if it doesnt already exist.
+  function scopeIdentifierName(name) {
+    if (options.onLocalDeclaration) options.onLocalDeclaration(name);
+    if (-1 !== indexOf(scopes[scopeDepth], name)) return;
+    scopes[scopeDepth].push(name);
+  }
+
+  // Add identifier to the current scope
+  function scopeIdentifier(node) {
+    scopeIdentifierName(node.name);
+    attachScope(node, true);
+  }
+
+  // Attach scope information to node. If the node is global, store it in the
+  // globals array so we can return the information to the user.
+  function attachScope(node, isLocal) {
+    if (!isLocal && -1 === indexOfObject(globals, 'name', node.name))
+      globals.push(node);
+
+    node.isLocal = isLocal;
+  }
+
+  // Is the identifier name available in this scope.
+  function scopeHasName(name) {
+    return (-1 !== indexOf(scopes[scopeDepth], name));
+  }
+
+  // Location tracking
+  // -----------------
+  //
+  // Locations are stored in FILO-array as a `Marker` object consisting of both
+  // `loc` and `range` data. Once a `Marker` is popped off the list an end
+  // location is added and the data is attached to a syntax node.
+
+  var locations = []
+    , trackLocations;
+
+  function createLocationMarker() {
+    return new Marker(token);
+  }
+
+  function Marker(token) {
+    if (options.locations) {
+      this.loc = {
+          start: {
+            line: token.line
+          , column: token.range[0] - token.lineStart
+        }
+        , end: {
+            line: 0
+          , column: 0
+        }
+      };
+    }
+    if (options.ranges) this.range = [token.range[0], 0];
+  }
+
+  // Complete the location data stored in the `Marker` by adding the location
+  // of the *previous token* as an end location.
+  Marker.prototype.complete = function() {
+    if (options.locations) {
+      this.loc.end.line = previousToken.lastLine || previousToken.line;
+      this.loc.end.column = previousToken.range[1] - (previousToken.lastLineStart || previousToken.lineStart);
+    }
+    if (options.ranges) {
+      this.range[1] = previousToken.range[1];
+    }
+  };
+
+  Marker.prototype.bless = function (node) {
+    if (this.loc) {
+      var loc = this.loc;
+      node.loc = {
+        start: {
+          line: loc.start.line,
+          column: loc.start.column
+        },
+        end: {
+          line: loc.end.line,
+          column: loc.end.column
+        }
+      };
+    }
+    if (this.range) {
+      node.range = [
+        this.range[0],
+        this.range[1]
+      ];
+    }
+  };
+
+  // Create a new `Marker` and add it to the FILO-array.
+  function markLocation() {
+    if (trackLocations) locations.push(createLocationMarker());
+  }
+
+  // Push an arbitrary `Marker` object onto the FILO-array.
+  function pushLocation(marker) {
+    if (trackLocations) locations.push(marker);
+  }
+
+  // Control flow tracking
+  // ---------------------
+  // A context object that validates loop breaks and `goto`-based control flow.
+
+  function FullFlowContext() {
+    this.scopes = [];
+    this.pendingGotos = [];
+  }
+
+  FullFlowContext.prototype.isInLoop = function () {
+    var i = this.scopes.length;
+    while (i --> 0) {
+      if (this.scopes[i].isLoop)
+        return true;
+    }
+    return false;
+  };
+
+  FullFlowContext.prototype.pushScope = function (isLoop) {
+    var scope = {
+      labels: {},
+      locals: [],
+      deferredGotos: [],
+      isLoop: !!isLoop
+    };
+    this.scopes.push(scope);
+  };
+
+  FullFlowContext.prototype.popScope = function () {
+    for (var i = 0; i < this.pendingGotos.length; ++i) {
+      var theGoto = this.pendingGotos[i];
+      if (theGoto.maxDepth >= this.scopes.length)
+        if (--theGoto.maxDepth <= 0)
+          raise(theGoto.token, errors.labelNotVisible, theGoto.target);
+    }
+
+    this.scopes.pop();
+  };
+
+  FullFlowContext.prototype.addGoto = function (target, token) {
+    var localCounts = [];
+
+    for (var i = 0; i < this.scopes.length; ++i) {
+      var scope = this.scopes[i];
+      localCounts.push(scope.locals.length);
+      if (Object.prototype.hasOwnProperty.call(scope.labels, target))
+        return;
+    }
+
+    this.pendingGotos.push({
+      maxDepth: this.scopes.length,
+      target: target,
+      token: token,
+      localCounts: localCounts
+    });
+  };
+
+  FullFlowContext.prototype.addLabel = function (name, token) {
+    var scope = this.currentScope();
+
+    if (Object.prototype.hasOwnProperty.call(scope.labels, name)) {
+      raise(token, errors.labelAlreadyDefined, name, scope.labels[name].line);
+    } else {
+      var newGotos = [];
+
+      for (var i = 0; i < this.pendingGotos.length; ++i) {
+        var theGoto = this.pendingGotos[i];
+
+        if (theGoto.maxDepth >= this.scopes.length && theGoto.target === name) {
+          if (theGoto.localCounts[this.scopes.length - 1] < scope.locals.length) {
+            scope.deferredGotos.push(theGoto);
+          }
+          continue;
+        }
+
+        newGotos.push(theGoto);
+      }
+
+      this.pendingGotos = newGotos;
+    }
+
+    scope.labels[name] = {
+      localCount: scope.locals.length,
+      line: token.line
+    };
+  };
+
+  FullFlowContext.prototype.addLocal = function (name, token) {
+    this.currentScope().locals.push({
+      name: name,
+      token: token
+    });
+  };
+
+  FullFlowContext.prototype.currentScope = function () {
+    return this.scopes[this.scopes.length - 1];
+  };
+
+  FullFlowContext.prototype.raiseDeferredErrors = function () {
+    var scope = this.currentScope();
+    var bads = scope.deferredGotos;
+    for (var i = 0; i < bads.length; ++i) {
+      var theGoto = bads[i];
+      raise(theGoto.token, errors.gotoJumpInLocalScope, theGoto.target, scope.locals[theGoto.localCounts[this.scopes.length - 1]].name);
+    }
+    // Would be dead code currently, but may be useful later
+    // if (bads.length)
+    //   scope.deferredGotos = [];
+  };
+
+  // Simplified context that only checks the validity of loop breaks.
+
+  function LoopFlowContext() {
+    this.level = 0;
+    this.loopLevels = [];
+  }
+
+  LoopFlowContext.prototype.isInLoop = function () {
+    return !!this.loopLevels.length;
+  };
+
+  LoopFlowContext.prototype.pushScope = function (isLoop) {
+    ++this.level;
+    if (isLoop)
+      this.loopLevels.push(this.level);
+  };
+
+  LoopFlowContext.prototype.popScope = function () {
+    var levels = this.loopLevels;
+    var levlen = levels.length;
+    if (levlen) {
+      if (levels[levlen - 1] === this.level)
+        levels.pop();
+    }
+    --this.level;
+  };
+
+  LoopFlowContext.prototype.addGoto =
+  LoopFlowContext.prototype.addLabel =
+  /* istanbul ignore next */
+  function () { throw new Error('This should never happen'); };
+
+  LoopFlowContext.prototype.addLocal =
+  LoopFlowContext.prototype.raiseDeferredErrors =
+  function () {};
+
+  function makeFlowContext() {
+    return features.labels ? new FullFlowContext() : new LoopFlowContext();
+  }
+
+  // Parse functions
+  // ---------------
+
+  // Chunk is the main program object. Syntactically it's the same as a block.
+  //
+  //     chunk ::= block
+
+  function parseChunk() {
+    next();
+    markLocation();
+    if (options.scope) createScope();
+    var flowContext = makeFlowContext();
+    flowContext.allowVararg = true;
+    flowContext.pushScope();
+    var body = parseBlock(flowContext);
+    flowContext.popScope();
+    if (options.scope) destroyScope();
+    if (EOF !== token.type) unexpected(token);
+    // If the body is empty no previousToken exists when finishNode runs.
+    if (trackLocations && !body.length) previousToken = token;
+    return finishNode(ast.chunk(body));
+  }
+
+  // A block contains a list of statements with an optional return statement
+  // as its last statement.
+  //
+  //     block ::= {stat} [retstat]
+
+  function parseBlock(flowContext) {
+    var block = []
+      , statement;
+
+    while (!isBlockFollow(token)) {
+      // Return has to be the last statement in a block.
+      // Likewise 'break' in Lua older than 5.2
+      if ('return' === token.value || (!features.relaxedBreak && 'break' === token.value)) {
+        block.push(parseStatement(flowContext));
+        break;
+      }
+      statement = parseStatement(flowContext);
+      consume(';');
+      // Statements are only added if they are returned, this allows us to
+      // ignore some statements, such as EmptyStatement.
+      if (statement) block.push(statement);
+    }
+
+    // Doesn't really need an ast node
+    return block;
+  }
+
+  // There are two types of statements, simple and compound.
+  //
+  //     statement ::= break | goto | do | while | repeat | return
+  //          | if | for | function | local | label | assignment
+  //          | functioncall | ';'
+
+  function parseStatement(flowContext) {
+    markLocation();
+
+    if (Punctuator === token.type) {
+      if (consume('::')) return parseLabelStatement(flowContext);
+    }
+
+    // When a `;` is encounted, simply eat it without storing it.
+    if (features.emptyStatement) {
+      if (consume(';')) {
+        if (trackLocations) locations.pop();
+        return;
+      }
+    }
+
+    flowContext.raiseDeferredErrors();
+
+    if (Keyword === token.type) {
+      switch (token.value) {
+        case 'local':    next(); return parseLocalStatement(flowContext);
+        case 'if':       next(); return parseIfStatement(flowContext);
+        case 'return':   next(); return parseReturnStatement(flowContext);
+        case 'function': next();
+          var name = parseFunctionName();
+          return parseFunctionDeclaration(name);
+        case 'while':    next(); return parseWhileStatement(flowContext);
+        case 'for':      next(); return parseForStatement(flowContext);
+        case 'repeat':   next(); return parseRepeatStatement(flowContext);
+        case 'break':    next();
+          if (!flowContext.isInLoop())
+            raise(token, errors.noLoopToBreak, token.value);
+          return parseBreakStatement();
+        case 'do':       next(); return parseDoStatement(flowContext);
+        case 'goto':     next(); return parseGotoStatement(flowContext);
+      }
+    }
+
+    if (features.contextualGoto &&
+        token.type === Identifier && token.value === 'goto' &&
+        lookahead.type === Identifier && lookahead.value !== 'goto') {
+      next(); return parseGotoStatement(flowContext);
+    }
+
+    // Assignments memorizes the location and pushes it manually for wrapper nodes.
+    if (trackLocations) locations.pop();
+
+    return parseAssignmentOrCallStatement(flowContext);
+  }
+
+  // ## Statements
+
+  //     label ::= '::' Name '::'
+
+  function parseLabelStatement(flowContext) {
+    var nameToken = token
+      , label = parseIdentifier();
+
+    if (options.scope) {
+      scopeIdentifierName('::' + nameToken.value + '::');
+      attachScope(label, true);
+    }
+
+    expect('::');
+
+    flowContext.addLabel(nameToken.value, nameToken);
+    return finishNode(ast.labelStatement(label));
+  }
+
+  //     break ::= 'break'
+
+  function parseBreakStatement() {
+    return finishNode(ast.breakStatement());
+  }
+
+  //     goto ::= 'goto' Name
+
+  function parseGotoStatement(flowContext) {
+    var name = token.value
+      , gotoToken = previousToken
+      , label = parseIdentifier();
+
+    flowContext.addGoto(name, gotoToken);
+    return finishNode(ast.gotoStatement(label));
+  }
+
+  //     do ::= 'do' block 'end'
+
+  function parseDoStatement(flowContext) {
+    if (options.scope) createScope();
+    flowContext.pushScope();
+    var body = parseBlock(flowContext);
+    flowContext.popScope();
+    if (options.scope) destroyScope();
+    expect('end');
+    return finishNode(ast.doStatement(body));
+  }
+
+  //     while ::= 'while' exp 'do' block 'end'
+
+  function parseWhileStatement(flowContext) {
+    var condition = parseExpectedExpression(flowContext);
+    expect('do');
+    if (options.scope) createScope();
+    flowContext.pushScope(true);
+    var body = parseBlock(flowContext);
+    flowContext.popScope();
+    if (options.scope) destroyScope();
+    expect('end');
+    return finishNode(ast.whileStatement(condition, body));
+  }
+
+  //     repeat ::= 'repeat' block 'until' exp
+
+  function parseRepeatStatement(flowContext) {
+    if (options.scope) createScope();
+    flowContext.pushScope(true);
+    var body = parseBlock(flowContext);
+    expect('until');
+    flowContext.raiseDeferredErrors();
+    var condition = parseExpectedExpression(flowContext);
+    flowContext.popScope();
+    if (options.scope) destroyScope();
+    return finishNode(ast.repeatStatement(condition, body));
+  }
+
+  //     retstat ::= 'return' [exp {',' exp}] [';']
+
+  function parseReturnStatement(flowContext) {
+    var expressions = [];
+
+    if ('end' !== token.value) {
+      var expression = parseExpression(flowContext);
+      if (null != expression) expressions.push(expression);
+      while (consume(',')) {
+        expression = parseExpectedExpression(flowContext);
+        expressions.push(expression);
+      }
+      consume(';'); // grammar tells us ; is optional here.
+    }
+    return finishNode(ast.returnStatement(expressions));
+  }
+
+  //     if ::= 'if' exp 'then' block {elif} ['else' block] 'end'
+  //     elif ::= 'elseif' exp 'then' block
+
+  function parseIfStatement(flowContext) {
+    var clauses = []
+      , condition
+      , body
+      , marker;
+
+    // IfClauses begin at the same location as the parent IfStatement.
+    // It ends at the start of `end`, `else`, or `elseif`.
+    if (trackLocations) {
+      marker = locations[locations.length - 1];
+      locations.push(marker);
+    }
+    condition = parseExpectedExpression(flowContext);
+    expect('then');
+    if (options.scope) createScope();
+    flowContext.pushScope();
+    body = parseBlock(flowContext);
+    flowContext.popScope();
+    if (options.scope) destroyScope();
+    clauses.push(finishNode(ast.ifClause(condition, body)));
+
+    if (trackLocations) marker = createLocationMarker();
+    while (consume('elseif')) {
+      pushLocation(marker);
+      condition = parseExpectedExpression(flowContext);
+      expect('then');
+      if (options.scope) createScope();
+      flowContext.pushScope();
+      body = parseBlock(flowContext);
+      flowContext.popScope();
+      if (options.scope) destroyScope();
+      clauses.push(finishNode(ast.elseifClause(condition, body)));
+      if (trackLocations) marker = createLocationMarker();
+    }
+
+    if (consume('else')) {
+      // Include the `else` in the location of ElseClause.
+      if (trackLocations) {
+        marker = new Marker(previousToken);
+        locations.push(marker);
+      }
+      if (options.scope) createScope();
+      flowContext.pushScope();
+      body = parseBlock(flowContext);
+      flowContext.popScope();
+      if (options.scope) destroyScope();
+      clauses.push(finishNode(ast.elseClause(body)));
+    }
+
+    expect('end');
+    return finishNode(ast.ifStatement(clauses));
+  }
+
+  // There are two types of for statements, generic and numeric.
+  //
+  //     for ::= Name '=' exp ',' exp [',' exp] 'do' block 'end'
+  //     for ::= namelist 'in' explist 'do' block 'end'
+  //     namelist ::= Name {',' Name}
+  //     explist ::= exp {',' exp}
+
+  function parseForStatement(flowContext) {
+    var variable = parseIdentifier()
+      , body;
+
+    // The start-identifier is local.
+
+    if (options.scope) {
+      createScope();
+      scopeIdentifier(variable);
+    }
+
+    // If the first expression is followed by a `=` punctuator, this is a
+    // Numeric For Statement.
+    if (consume('=')) {
+      // Start expression
+      var start = parseExpectedExpression(flowContext);
+      expect(',');
+      // End expression
+      var end = parseExpectedExpression(flowContext);
+      // Optional step expression
+      var step = consume(',') ? parseExpectedExpression(flowContext) : null;
+
+      expect('do');
+      flowContext.pushScope(true);
+      body = parseBlock(flowContext);
+      flowContext.popScope();
+      expect('end');
+      if (options.scope) destroyScope();
+
+      return finishNode(ast.forNumericStatement(variable, start, end, step, body));
+    }
+    // If not, it's a Generic For Statement
+    else {
+      // The namelist can contain one or more identifiers.
+      var variables = [variable];
+      while (consume(',')) {
+        variable = parseIdentifier();
+        // Each variable in the namelist is locally scoped.
+        if (options.scope) scopeIdentifier(variable);
+        variables.push(variable);
+      }
+      expect('in');
+      var iterators = [];
+
+      // One or more expressions in the explist.
+      do {
+        var expression = parseExpectedExpression(flowContext);
+        iterators.push(expression);
+      } while (consume(','));
+
+      expect('do');
+      flowContext.pushScope(true);
+      body = parseBlock(flowContext);
+      flowContext.popScope();
+      expect('end');
+      if (options.scope) destroyScope();
+
+      return finishNode(ast.forGenericStatement(variables, iterators, body));
+    }
+  }
+
+  // Local statements can either be variable assignments or function
+  // definitions. If a function definition is found, it will be delegated to
+  // `parseFunctionDeclaration()` with the isLocal flag.
+  //
+  // This AST structure might change into a local assignment with a function
+  // child.
+  //
+  //     local ::= 'local' 'function' Name funcdecl
+  //        | 'local' Name {',' Name} ['=' exp {',' exp}]
+
+  function parseLocalStatement(flowContext) {
+    var name
+      , declToken = previousToken;
+
+    if (Identifier === token.type) {
+      var variables = []
+        , init = [];
+
+      do {
+        name = parseIdentifier();
+
+        variables.push(name);
+        flowContext.addLocal(name.name, declToken);
+      } while (consume(','));
+
+      if (consume('=')) {
+        do {
+          var expression = parseExpectedExpression(flowContext);
+          init.push(expression);
+        } while (consume(','));
+      }
+
+      // Declarations doesn't exist before the statement has been evaluated.
+      // Therefore assignments can't use their declarator. And the identifiers
+      // shouldn't be added to the scope until the statement is complete.
+      if (options.scope) {
+        for (var i = 0, l = variables.length; i < l; ++i) {
+          scopeIdentifier(variables[i]);
+        }
+      }
+
+      return finishNode(ast.localStatement(variables, init));
+    }
+    if (consume('function')) {
+      name = parseIdentifier();
+      flowContext.addLocal(name.name, declToken);
+
+      if (options.scope) {
+        scopeIdentifier(name);
+        createScope();
+      }
+
+      // MemberExpressions are not allowed in local function statements.
+      return parseFunctionDeclaration(name, true);
+    } else {
+      raiseUnexpectedToken('<name>', token);
+    }
+  }
+
+  //     assignment ::= varlist '=' explist
+  //     var ::= Name | prefixexp '[' exp ']' | prefixexp '.' Name
+  //     varlist ::= var {',' var}
+  //     explist ::= exp {',' exp}
+  //
+  //     call ::= callexp
+  //     callexp ::= prefixexp args | prefixexp ':' Name args
+
+  function parseAssignmentOrCallStatement(flowContext) {
+    // Keep a reference to the previous token for better error messages in case
+    // of invalid statement
+    var previous = token
+      , marker, startMarker;
+    var lvalue, base, name;
+
+    var targets = [];
+
+    if (trackLocations) startMarker = createLocationMarker();
+
+    do {
+      if (trackLocations) marker = createLocationMarker();
+
+      if (Identifier === token.type) {
+        name = token.value;
+        base = parseIdentifier();
+        // Set the parent scope.
+        if (options.scope) attachScope(base, scopeHasName(name));
+        lvalue = true;
+      } else if ('(' === token.value) {
+        next();
+        base = parseExpectedExpression(flowContext);
+        expect(')');
+        lvalue = false;
+      } else {
+        return unexpected(token);
+      }
+
+      both: for (;;) {
+        var newBase;
+
+        switch (StringLiteral === token.type ? '"' : token.value) {
+        case '.':
+        case '[':
+          lvalue = true;
+          break;
+        case ':':
+        case '(':
+        case '{':
+        case '"':
+          lvalue = null;
+          break;
+        default:
+          break both;
+        }
+
+        base = parsePrefixExpressionPart(base, marker, flowContext);
+      }
+
+      targets.push(base);
+
+      if (',' !== token.value)
+        break;
+
+      if (!lvalue) {
+        return unexpected(token);
+      }
+
+      next();
+    } while (true);
+
+    if (targets.length === 1 && lvalue === null) {
+      pushLocation(marker);
+      return finishNode(ast.callStatement(targets[0]));
+    } else if (!lvalue) {
+      return unexpected(token);
+    }
+
+    expect('=');
+
+    var values = [];
+
+    do {
+      values.push(parseExpectedExpression(flowContext));
+    } while (consume(','));
+
+    pushLocation(startMarker);
+    return finishNode(ast.assignmentStatement(targets, values));
+  }
+
+  // ### Non-statements
+
+  //     Identifier ::= Name
+
+  function parseIdentifier() {
+    markLocation();
+    var identifier = token.value;
+    if (Identifier !== token.type) raiseUnexpectedToken('<name>', token);
+    next();
+    return finishNode(ast.identifier(identifier));
+  }
+
+  // Parse the functions parameters and body block. The name should already
+  // have been parsed and passed to this declaration function. By separating
+  // this we allow for anonymous functions in expressions.
+  //
+  // For local functions there's a boolean parameter which needs to be set
+  // when parsing the declaration.
+  //
+  //     funcdecl ::= '(' [parlist] ')' block 'end'
+  //     parlist ::= Name {',' Name} | [',' '...'] | '...'
+
+  function parseFunctionDeclaration(name, isLocal) {
+    var flowContext = makeFlowContext();
+    flowContext.pushScope();
+
+    var parameters = [];
+    expect('(');
+
+    // The declaration has arguments
+    if (!consume(')')) {
+      // Arguments are a comma separated list of identifiers, optionally ending
+      // with a vararg.
+      while (true) {
+        if (Identifier === token.type) {
+          var parameter = parseIdentifier();
+          // Function parameters are local.
+          if (options.scope) scopeIdentifier(parameter);
+
+          parameters.push(parameter);
+
+          if (consume(',')) continue;
+        }
+        // No arguments are allowed after a vararg.
+        else if (VarargLiteral === token.type) {
+          flowContext.allowVararg = true;
+          parameters.push(parsePrimaryExpression(flowContext));
+        } else {
+          raiseUnexpectedToken('<name> or \'...\'', token);
+        }
+        expect(')');
+        break;
+      }
+    }
+
+    var body = parseBlock(flowContext);
+    flowContext.popScope();
+    expect('end');
+    if (options.scope) destroyScope();
+
+    isLocal = isLocal || false;
+    return finishNode(ast.functionStatement(name, parameters, isLocal, body));
+  }
+
+  // Parse the function name as identifiers and member expressions.
+  //
+  //     Name {'.' Name} [':' Name]
+
+  function parseFunctionName() {
+    var base, name, marker;
+
+    if (trackLocations) marker = createLocationMarker();
+    base = parseIdentifier();
+
+    if (options.scope) {
+      attachScope(base, scopeHasName(base.name));
+      createScope();
+    }
+
+    while (consume('.')) {
+      pushLocation(marker);
+      name = parseIdentifier();
+      base = finishNode(ast.memberExpression(base, '.', name));
+    }
+
+    if (consume(':')) {
+      pushLocation(marker);
+      name = parseIdentifier();
+      base = finishNode(ast.memberExpression(base, ':', name));
+      if (options.scope) scopeIdentifierName('self');
+    }
+
+    return base;
+  }
+
+  //     tableconstructor ::= '{' [fieldlist] '}'
+  //     fieldlist ::= field {fieldsep field} fieldsep
+  //     field ::= '[' exp ']' '=' exp | Name = 'exp' | exp
+  //
+  //     fieldsep ::= ',' | ';'
+
+  function parseTableConstructor(flowContext) {
+    var fields = []
+      , key, value;
+
+    while (true) {
+      markLocation();
+      if (Punctuator === token.type && consume('[')) {
+        key = parseExpectedExpression(flowContext);
+        expect(']');
+        expect('=');
+        value = parseExpectedExpression(flowContext);
+        fields.push(finishNode(ast.tableKey(key, value)));
+      } else if (Identifier === token.type) {
+        if ('=' === lookahead.value) {
+          key = parseIdentifier();
+          next();
+          value = parseExpectedExpression(flowContext);
+          fields.push(finishNode(ast.tableKeyString(key, value)));
+        } else {
+          value = parseExpectedExpression(flowContext);
+          fields.push(finishNode(ast.tableValue(value)));
+        }
+      } else {
+        if (null == (value = parseExpression(flowContext))) {
+          locations.pop();
+          break;
+        }
+        fields.push(finishNode(ast.tableValue(value)));
+      }
+      if (',;'.indexOf(token.value) >= 0) {
+        next();
+        continue;
+      }
+      break;
+    }
+    expect('}');
+    return finishNode(ast.tableConstructorExpression(fields));
+  }
+
+  // Expression parser
+  // -----------------
+  //
+  // Expressions are evaluated and always return a value. If nothing is
+  // matched null will be returned.
+  //
+  //     exp ::= (unop exp | primary | prefixexp ) { binop exp }
+  //
+  //     primary ::= nil | false | true | Number | String | '...'
+  //          | functiondef | tableconstructor
+  //
+  //     prefixexp ::= (Name | '(' exp ')' ) { '[' exp ']'
+  //          | '.' Name | ':' Name args | args }
+  //
+
+  function parseExpression(flowContext) {
+    var expression = parseSubExpression(0, flowContext);
+    return expression;
+  }
+
+  // Parse an expression expecting it to be valid.
+
+  function parseExpectedExpression(flowContext) {
+    var expression = parseExpression(flowContext);
+    if (null == expression) raiseUnexpectedToken('<expression>', token);
+    else return expression;
+  }
+
+
+  // Return the precedence priority of the operator.
+  //
+  // As unary `-` can't be distinguished from binary `-`, unary precedence
+  // isn't described in this table but in `parseSubExpression()` itself.
+  //
+  // As this function gets hit on every expression it's been optimized due to
+  // the expensive CompareICStub which took ~8% of the parse time.
+
+  function binaryPrecedence(operator) {
+    var charCode = operator.charCodeAt(0)
+      , length = operator.length;
+
+    if (1 === length) {
+      switch (charCode) {
+        case 94: return 12; // ^
+        case 42: case 47: case 37: return 10; // * / %
+        case 43: case 45: return 9; // + -
+        case 38: return 6; // &
+        case 126: return 5; // ~
+        case 124: return 4; // |
+        case 60: case 62: return 3; // < >
+      }
+    } else if (2 === length) {
+      switch (charCode) {
+        case 47: return 10; // //
+        case 46: return 8; // ..
+        case 60: case 62:
+            if('<<' === operator || '>>' === operator) return 7; // << >>
+            return 3; // <= >=
+        case 61: case 126: return 3; // == ~=
+        case 111: return 1; // or
+      }
+    } else if (97 === charCode && 'and' === operator) return 2;
+    return 0;
+  }
+
+  // Implement an operator-precedence parser to handle binary operator
+  // precedence.
+  //
+  // We use this algorithm because it's compact, it's fast and Lua core uses
+  // the same so we can be sure our expressions are parsed in the same manner
+  // without excessive amounts of tests.
+  //
+  //     exp ::= (unop exp | primary | prefixexp ) { binop exp }
+
+  function parseSubExpression(minPrecedence, flowContext) {
+    var operator = token.value
+    // The left-hand side in binary operations.
+      , expression, marker;
+
+    if (trackLocations) marker = createLocationMarker();
+
+    // UnaryExpression
+    if (isUnary(token)) {
+      markLocation();
+      next();
+      var argument = parseSubExpression(10, flowContext);
+      if (argument == null) raiseUnexpectedToken('<expression>', token);
+      expression = finishNode(ast.unaryExpression(operator, argument));
+    }
+    if (null == expression) {
+      // PrimaryExpression
+      expression = parsePrimaryExpression(flowContext);
+
+      // PrefixExpression
+      if (null == expression) {
+        expression = parsePrefixExpression(flowContext);
+      }
+    }
+    // This is not a valid left hand expression.
+    if (null == expression) return null;
+
+    var precedence;
+    while (true) {
+      operator = token.value;
+
+      precedence = (Punctuator === token.type || Keyword === token.type) ?
+        binaryPrecedence(operator) : 0;
+
+      if (precedence === 0 || precedence <= minPrecedence) break;
+      // Right-hand precedence operators
+      if ('^' === operator || '..' === operator) --precedence;
+      next();
+      var right = parseSubExpression(precedence, flowContext);
+      if (null == right) raiseUnexpectedToken('<expression>', token);
+      // Push in the marker created before the loop to wrap its entirety.
+      if (trackLocations) locations.push(marker);
+      expression = finishNode(ast.binaryExpression(operator, expression, right));
+
+    }
+    return expression;
+  }
+
+  //     prefixexp ::= prefix {suffix}
+  //     prefix ::= Name | '(' exp ')'
+  //     suffix ::= '[' exp ']' | '.' Name | ':' Name args | args
+  //
+  //     args ::= '(' [explist] ')' | tableconstructor | String
+
+  function parsePrefixExpressionPart(base, marker, flowContext) {
+    var expression, identifier;
+
+    if (Punctuator === token.type) {
+      switch (token.value) {
+        case '[':
+          pushLocation(marker);
+          next();
+          expression = parseExpectedExpression(flowContext);
+          expect(']');
+          return finishNode(ast.indexExpression(base, expression));
+        case '.':
+          pushLocation(marker);
+          next();
+          identifier = parseIdentifier();
+          return finishNode(ast.memberExpression(base, '.', identifier));
+        case ':':
+          pushLocation(marker);
+          next();
+          identifier = parseIdentifier();
+          base = finishNode(ast.memberExpression(base, ':', identifier));
+          // Once a : is found, this has to be a CallExpression, otherwise
+          // throw an error.
+          pushLocation(marker);
+          return parseCallExpression(base, flowContext);
+        case '(': case '{': // args
+          pushLocation(marker);
+          return parseCallExpression(base, flowContext);
+      }
+    } else if (StringLiteral === token.type) {
+      pushLocation(marker);
+      return parseCallExpression(base, flowContext);
+    }
+
+    return null;
+  }
+
+  function parsePrefixExpression(flowContext) {
+    var base, name, marker;
+
+    if (trackLocations) marker = createLocationMarker();
+
+    // The prefix
+    if (Identifier === token.type) {
+      name = token.value;
+      base = parseIdentifier();
+      // Set the parent scope.
+      if (options.scope) attachScope(base, scopeHasName(name));
+    } else if (consume('(')) {
+      base = parseExpectedExpression(flowContext);
+      expect(')');
+    } else {
+      return null;
+    }
+
+    // The suffix
+    for (;;) {
+      var newBase = parsePrefixExpressionPart(base, marker, flowContext);
+      if (newBase === null)
+        break;
+      base = newBase;
+    }
+
+    return base;
+  }
+
+  //     args ::= '(' [explist] ')' | tableconstructor | String
+
+  function parseCallExpression(base, flowContext) {
+    if (Punctuator === token.type) {
+      switch (token.value) {
+        case '(':
+          if (!features.emptyStatement) {
+            if (token.line !== previousToken.line)
+              raise(null, errors.ambiguousSyntax, token.value);
+          }
+          next();
+
+          // List of expressions
+          var expressions = [];
+          var expression = parseExpression(flowContext);
+          if (null != expression) expressions.push(expression);
+          while (consume(',')) {
+            expression = parseExpectedExpression(flowContext);
+            expressions.push(expression);
+          }
+
+          expect(')');
+          return finishNode(ast.callExpression(base, expressions));
+
+        case '{':
+          markLocation();
+          next();
+          var table = parseTableConstructor(flowContext);
+          return finishNode(ast.tableCallExpression(base, table));
+      }
+    } else if (StringLiteral === token.type) {
+      return finishNode(ast.stringCallExpression(base, parsePrimaryExpression(flowContext)));
+    }
+
+    raiseUnexpectedToken('function arguments', token);
+  }
+
+  //     primary ::= String | Numeric | nil | true | false
+  //          | functiondef | tableconstructor | '...'
+
+  function parsePrimaryExpression(flowContext) {
+    var literals = StringLiteral | NumericLiteral | BooleanLiteral | NilLiteral | VarargLiteral
+      , value = token.value
+      , type = token.type
+      , marker;
+
+    if (trackLocations) marker = createLocationMarker();
+
+    if (type === VarargLiteral && !flowContext.allowVararg) {
+      raise(token, errors.cannotUseVararg, token.value);
+    }
+
+    if (type & literals) {
+      pushLocation(marker);
+      var raw = input.slice(token.range[0], token.range[1]);
+      next();
+      return finishNode(ast.literal(type, value, raw));
+    } else if (Keyword === type && 'function' === value) {
+      pushLocation(marker);
+      next();
+      if (options.scope) createScope();
+      return parseFunctionDeclaration(null);
+    } else if (consume('{')) {
+      pushLocation(marker);
+      return parseTableConstructor(flowContext);
+    }
+  }
+
+  // Parser
+  // ------
+
+  // Export the main parser.
+  //
+  //   - `wait` Hold parsing until end() is called. Defaults to false
+  //   - `comments` Store comments. Defaults to true.
+  //   - `scope` Track identifier scope. Defaults to false.
+  //   - `locations` Store location information. Defaults to false.
+  //   - `ranges` Store the start and end character locations. Defaults to
+  //     false.
+  //   - `onCreateNode` Callback which will be invoked when a syntax node is
+  //     created.
+  //   - `onCreateScope` Callback which will be invoked when a new scope is
+  //     created.
+  //   - `onDestroyScope` Callback which will be invoked when the current scope
+  //     is destroyed.
+  //
+  // Example:
+  //
+  //     var parser = require('luaparser');
+  //     parser.parse('i = 0');
+
+  exports.parse = parse;
+
+  var versionFeatures = {
+    '5.1': {
+    },
+    '5.2': {
+      labels: true,
+      emptyStatement: true,
+      hexEscapes: true,
+      skipWhitespaceEscape: true,
+      strictEscapes: true,
+      relaxedBreak: true
+    },
+    '5.3': {
+      labels: true,
+      emptyStatement: true,
+      hexEscapes: true,
+      skipWhitespaceEscape: true,
+      strictEscapes: true,
+      unicodeEscapes: true,
+      bitwiseOperators: true,
+      integerDivision: true,
+      relaxedBreak: true
+    },
+    'LuaJIT': {
+      // XXX: LuaJIT language features may depend on compilation options; may need to
+      // rethink how to handle this. Specifically, there is a LUAJIT_ENABLE_LUA52COMPAT
+      // that removes contextual goto. Maybe add 'LuaJIT-5.2compat' as well?
+      labels: true,
+      contextualGoto: true,
+      hexEscapes: true,
+      skipWhitespaceEscape: true,
+      strictEscapes: true,
+      unicodeEscapes: true,
+      imaginaryNumbers: true,
+      integerSuffixes: true
+    }
+  };
+
+  function parse(_input, _options) {
+    if ('undefined' === typeof _options && 'object' === typeof _input) {
+      _options = _input;
+      _input = undefined;
+    }
+    if (!_options) _options = {};
+
+    input = _input || '';
+    options = assign({}, defaultOptions, _options);
+
+    // Rewind the lexer
+    index = 0;
+    line = 1;
+    lineStart = 0;
+    length = input.length;
+    // When tracking identifier scope, initialize with an empty scope.
+    scopes = [[]];
+    scopeDepth = 0;
+    globals = [];
+    locations = [];
+
+    if (!Object.prototype.hasOwnProperty.call(versionFeatures, options.luaVersion)) {
+      throw new Error(sprintf("Lua version '%1' not supported", options.luaVersion));
+    }
+
+    features = assign({}, versionFeatures[options.luaVersion]);
+    if (options.extendedIdentifiers !== void 0)
+      features.extendedIdentifiers = !!options.extendedIdentifiers;
+
+    if (!Object.prototype.hasOwnProperty.call(encodingModes, options.encodingMode)) {
+      throw new Error(sprintf("Encoding mode '%1' not supported", options.encodingMode));
+    }
+
+    encodingMode = encodingModes[options.encodingMode];
+
+    if (options.comments) comments = [];
+    if (!options.wait) return end();
+    return exports;
+  }
+
+  // Write to the source code buffer without beginning the parse.
+  exports.write = write;
+
+  function write(_input) {
+    input += String(_input);
+    length = input.length;
+    return exports;
+  }
+
+  // Send an EOF and begin parsing.
+  exports.end = end;
+
+  function end(_input) {
+    if ('undefined' !== typeof _input) write(_input);
+
+    // Ignore shebangs.
+    if (input && input.substr(0, 2) === '#!') input = input.replace(/^.*/, function (line) {
+      return line.replace(/./g, ' ');
+    });
+
+    length = input.length;
+    trackLocations = options.locations || options.ranges;
+    // Initialize with a lookahead token.
+    lookahead = lex();
+
+    var chunk = parseChunk();
+    if (options.comments) chunk.comments = comments;
+    if (options.scope) chunk.globals = globals;
+
+    /* istanbul ignore if */
+    if (locations.length > 0)
+      throw new Error('Location tracking failed. This is most likely a bug in luaparse');
+
+    return chunk;
+  }
+
+}));
+/* vim: set sw=2 ts=2 et tw=79 : */
+
+},{}],
+90:[function(module,exports,require,process){
+const { mapOutsideLuaStrings } = require("../core/luaStrings.js");
+
+function evalNumericExpression(expression) {
+  if (expression.length > 80) return null;
+  if (!/[+\-*/%^]/.test(expression)) return null;
+  if (!/^[\d\s+\-*/%^().]+$/.test(expression)) return null;
+  try {
+    const jsExpression = expression.replace(/\^/g, "**");
+    const value = Function(`"use strict"; return (${jsExpression});`)();
+    if (!Number.isFinite(value)) return null;
+    if (Math.abs(value) > Number.MAX_SAFE_INTEGER) return null;
+    const rounded = Math.round(value * 1_000_000_000) / 1_000_000_000;
+    return Number.isInteger(rounded) ? String(rounded) : String(rounded);
+  } catch {
+    return null;
+  }
+}
+
+function foldChunk(chunk) {
+  let folded = 0;
+  let previous;
+  let code = chunk;
+
+  do {
+    previous = code;
+    code = code.replace(/\((-?\d+(?:\.\d+)?)\)/g, (full, value, offset, whole) => {
+      const previousChar = whole[offset - 1] ?? "";
+      const nextChar = whole[offset + full.length] ?? "";
+      if (/[A-Za-z0-9_\].]/.test(previousChar) || /[A-Za-z_]/.test(nextChar)) return full;
+      folded += 1;
+      return value;
+    });
+
+    code = code.replace(/\(([\d\s+\-*/%^.]{3,80})\)/g, (full, expression, offset, whole) => {
+      const value = evalNumericExpression(expression);
+      if (value === null) return full;
+      folded += 1;
+      const previous = whole[offset - 1] ?? "";
+      if (/[A-Za-z0-9_\])]/.test(previous)) return `(${value})`;
+      return value;
+    });
+  } while (code !== previous);
+
+  code = code.replace(/\b\d+(?:\.\d+)?\s*[+\-*/%^]\s*-?\d+(?:\.\d+)?\b/g, (full) => {
+    const value = evalNumericExpression(full);
+    if (value === null) return full;
+    folded += 1;
+    return value;
+  });
+
+  return { code, folded };
+}
+
+function foldNumericNoise(source) {
+  let folded = 0;
+  const code = mapOutsideLuaStrings(source, (chunk) => {
+    const result = foldChunk(chunk);
+    folded += result.folded;
+    return result.code;
+  });
+
+  return { code, folded };
+}
+
+exports.foldNumericNoise = foldNumericNoise;
+
+},{"../core/luaStrings.js":86}],
+91:[function(module,exports,require,process){
+const { readLuaQuotedString, mapOutsideLuaStrings } = require("../core/luaStrings.js");
+
+function skipSpace(source, index) {
+  let i = index;
+  while (i < source.length && /\s/.test(source[i])) i += 1;
+  return i;
+}
+
+function findLineCommentEnd(source, startIndex) {
+  const lf = source.indexOf("\n", startIndex);
+  const cr = source.indexOf("\r", startIndex);
+  let end;
+  if (lf === -1) end = cr === -1 ? source.length : cr;
+  else if (cr === -1) end = lf;
+  else end = Math.min(lf, cr);
+  if (end >= source.length) return source.length;
+  return source[end] === "\r" && source[end + 1] === "\n" ? end + 2 : end + 1;
+}
+
+function replaceStringLengthLiterals(source) {
+  let out = "";
+  let replaced = 0;
+  let i = 0;
+
+  while (i < source.length) {
+    const char = source[i];
+
+    if (char === '"' || char === "'") {
+      try {
+        const parsed = readLuaQuotedString(source, i);
+        out += parsed.raw;
+        i = parsed.end;
+      } catch {
+        out += source.slice(i);
+        break;
+      }
+      continue;
+    }
+
+    if (source.startsWith("--[[", i)) {
+      const end = source.indexOf("]]", i + 4);
+      const commentEnd = end === -1 ? source.length : end + 2;
+      out += source.slice(i, commentEnd);
+      i = commentEnd;
+      continue;
+    }
+
+    if (source.startsWith("--", i)) {
+      const commentEnd = findLineCommentEnd(source, i + 2);
+      out += source.slice(i, commentEnd);
+      i = commentEnd;
+      continue;
+    }
+
+    if (char === "#") {
+      const stringStart = skipSpace(source, i + 1);
+      const quote = source[stringStart];
+      if (quote === '"' || quote === "'") {
+        try {
+          const parsed = readLuaQuotedString(source, stringStart);
+          out += String(parsed.bytes.length);
+          i = parsed.end;
+          replaced += 1;
+          continue;
+        } catch {
+          // Fall through and preserve the original byte.
+        }
+      }
+    }
+
+    out += char;
+    i += 1;
+  }
+
+  return { code: out, replaced };
+}
+
+function replaceWithCount(source, pattern, replacement) {
+  let count = 0;
+  const code = source.replace(pattern, (...args) => {
+    count += 1;
+    return typeof replacement === "function" ? replacement(...args) : replacement;
+  });
+  return { code, count };
+}
+
+function simplifyThunkChunk(chunk) {
+  let simplified = 0;
+  let code = chunk;
+
+  const empty = replaceWithCount(
+    code,
+    /\(\s*function\s*\(\s*\)\s*return\s*;?\s*end\s*\)\s*\(\s*\)/g,
+    "nil"
+  );
+  code = empty.code;
+  simplified += empty.count;
+
+  const tableReturn = replaceWithCount(
+    code,
+    /\(\s*function\s*\(\s*\)\s*return\s+(\{[^;\n]*?\})\s*;?\s*end\s*\)\s*\(\s*\)/g,
+    (_full, expression) => `(${expression.trim()})`
+  );
+  code = tableReturn.code;
+  simplified += tableReturn.count;
+
+  const simpleReturn = replaceWithCount(
+    code,
+    /\(\s*function\s*\(\s*\)\s*return\s+([^;{}\n]*?)\s*;?\s*end\s*\)\s*\(\s*\)/g,
+    (_full, expression) => `(${expression.trim()})`
+  );
+  code = simpleReturn.code;
+  simplified += simpleReturn.count;
+
+  return { code, simplified };
+}
+
+function simplifyBooleanChunk(chunk) {
+  let simplified = 0;
+  let code = chunk.replace(/\b(-?\d+(?:\.\d+)?)\s*(==|~=|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)\b/g, (full, left, operator, right) => {
+    const a = Number(left);
+    const b = Number(right);
+    let value;
+    if (operator === "==") value = a === b;
+    else if (operator === "~=") value = a !== b;
+    else if (operator === "<=") value = a <= b;
+    else if (operator === ">=") value = a >= b;
+    else if (operator === "<") value = a < b;
+    else if (operator === ">") value = a > b;
+    else return full;
+
+    simplified += 1;
+    return value ? "true" : "false";
+  });
+
+  const replacements = [
+    [/\(\s*true\s*\)\s*and\s*/g, ""],
+    [/\s*and\s*\(\s*true\s*\)/g, ""],
+    [/\(\s*false\s*\)\s*or\s*/g, ""],
+    [/\s*or\s*\(\s*false\s*\)/g, ""],
+    [/\bnot\s*\(\s*false\s*\)/g, "true"],
+    [/\bnot\s*\(\s*true\s*\)/g, "false"]
+  ];
+
+  for (const [pattern, replacement] of replacements) {
+    const result = replaceWithCount(code, pattern, replacement);
+    code = result.code;
+    simplified += result.count;
+  }
+
+  return { code, simplified };
+}
+
+function mapWithCount(source, mapper) {
+  let total = 0;
+  const code = mapOutsideLuaStrings(source, (chunk) => {
+    const result = mapper(chunk);
+    total += result.simplified;
+    return result.code;
+  });
+  return { code, total };
+}
+
+function simplifySourceNoise(source) {
+  let simplified = 0;
+
+  const lengths = replaceStringLengthLiterals(source);
+  let code = lengths.code;
+  simplified += lengths.replaced;
+
+  const thunks = mapWithCount(code, simplifyThunkChunk);
+  code = thunks.code;
+  simplified += thunks.total;
+
+  const booleans = mapWithCount(code, simplifyBooleanChunk);
+  code = booleans.code;
+  simplified += booleans.total;
+
+  return { code, simplified };
+}
+
+exports.simplifySourceNoise = simplifySourceNoise;
+
+},{"../core/luaStrings.js":86}],
+92:[function(module,exports,require,process){
+const { mapOutsideLuaStrings } = require("../core/luaStrings.js");
+
+function cleanupChunk(chunk) {
+  return chunk
+    .replace(/\s+/g, " ")
+    .replace(/\s*;\s*/g, ";\n")
+    .replace(/\s*,\s*/g, ", ")
+    .replace(/\s*=\s*/g, "=")
+    .replace(/\s*([{}[\]()+\-*/%<>])\s*/g, "$1")
+    .replace(/\bthen\s+/g, "then\n")
+    .replace(/\bdo\s+/g, "do\n")
+    .replace(/\belse\s+/g, "else\n")
+    .replace(/\belseif\s+/g, "elseif ")
+    .replace(/\bend\s*;?/g, "end\n")
+    .replace(/\bfunction\s*\(/g, "function(")
+    .replace(/\bif\s+/g, "if ")
+    .replace(/\bfor\s+/g, "for ")
+    .replace(/\bwhile\s+/g, "while ")
+    .replace(/\brepeat\s+/g, "repeat\n")
+    .replace(/\buntil\s+/g, "until ");
+}
+
+function lightIndent(source) {
+  const lines = source
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  let depth = 0;
+  const out = [];
+
+  for (const line of lines) {
+    if (/^(end|else\b|elseif\b|until\b)/.test(line)) depth = Math.max(0, depth - 1);
+    out.push(`${"  ".repeat(depth)}${line}`);
+    if (/\b(then|do)\s*$/.test(line) || /\bfunction\b/.test(line) || /^else\b/.test(line) || /^elseif\b/.test(line) || /^repeat\b/.test(line)) {
+      depth += 1;
+    }
+  }
+
+  return `${out.join("\n")}\n`;
+}
+
+function cleanupLua(source) {
+  const split = mapOutsideLuaStrings(source, cleanupChunk)
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return lightIndent(split);
+}
+
+exports.cleanupLua = cleanupLua;
+
+},{"../core/luaStrings.js":86}],
 };
 var cache={};
 function load(id){ if(cache[id]) return cache[id].exports; var d=defs[id]; var m={exports:{}}; cache[id]=m;
@@ -35251,5 +43340,6 @@ Object.defineProperty(window.Deob,"clyde",{get:function(){return load(60);}});
 Object.defineProperty(window.Deob,"luaobf",{get:function(){return load(71);}});
 Object.defineProperty(window.Deob,"ironveil",{get:function(){return load(75);}});
 Object.defineProperty(window.Deob,"ironbeaut",{get:function(){return load(82);}});
+Object.defineProperty(window.Deob,"lsdluaobf",{get:function(){return load(83);}});
 Object.defineProperty(window.Deob,"luaobfio",{get:function(){return load(72);}});
 })();

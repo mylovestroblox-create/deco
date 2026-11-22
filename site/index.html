@@ -282,6 +282,11 @@
       },
       luaobf: function (s) {
         var r;
+        try {
+          var q = Deob.lsdluaobf.deobfuscateLuaObfuscator(s, {});
+          var qc = q && (q.code || q.output || (typeof q === 'string' ? q : ''));
+          if (qc && qc.length > 20) return { code: qc, info: 'LuaObfuscator' };
+        } catch (e0) {}
         try { r = Deob.luaobf.deobf(s, { log: false }); }
         catch (e) { if (/^det:/.test(e.message)) throw new Error('doesn\'t look like LuaObfuscator'); throw e; }
         var code = r.reconstructed || r.lua;
